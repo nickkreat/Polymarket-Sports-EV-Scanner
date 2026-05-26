@@ -3,7 +3,7 @@ import { fetchSportsMarkets } from '../services/polymarket';
 import { fetchAllFuturesOdds, fetchRelevantSportKeys } from '../services/oddsApi';
 import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
-import { extractTeamFromQuestion, teamMatchScore } from '../utils/matching';
+import { extractTeamFromQuestion, teamMatchScore, isSportsMarket } from '../utils/matching';
 
 const MIN_MATCH_SCORE = 0.6;
 
@@ -61,15 +61,16 @@ export function useScanner(settings) {
       }
 
       setStatus('scanning — computing EV…');
-      const { results, stats } = buildOpportunities(polyMarkets, oddsEvents, settings);
+      const { results, stats } = await buildOpportunities(polyMarkets, oddsEvents, settings);
       console.debug('[Scanner] Match stats:', stats);
       console.debug(`[Scanner] Found ${results.length} opportunities`);
 
       setOpportunities(results);
       setLastScanned(new Date());
       setScanStats({
-        polyMarketsScanned:  polyMarkets.length,
-        oddsEventsScanned:   oddsEvents.length,
+        polyMarketsScanned:       polyMarkets.length,
+        oddsEventsScanned:        oddsEvents.length,
+        skippedNonSports:         stats.skippedNonSports,
         binaryMarketsChecked:     stats.binaryChecked,
         binaryNoQuestionMatch:    stats.binaryNoQuestion,
         binaryNoOddsMatch:        stats.binaryNoOddsMatch,
@@ -77,8 +78,8 @@ export function useScanner(settings) {
         multiNoOddsMatch:         stats.multiNoOddsMatch,
         filteredByLiquidity:      stats.filteredLiquidity,
         filteredByEv:             stats.filteredEv,
-        matchedMarkets:   results.length,
-        positiveEv:       results.filter(r => r.evPct > 0).length,
+        matchedMarkets:           results.length,
+        positiveEv:               results.filter(r => r.evPct > 0).length,
       });
       setStatus('done');
     } catch (err) {
@@ -105,9 +106,14 @@ function isBinaryYesNo(outcomes) {
   return lower.includes('yes') && lower.includes('no');
 }
 
+// Yield to the browser event loop so the page stays responsive.
+function yieldToBrowser() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
 // ── Core matching + EV engine ─────────────────────────────────────────────────
 
-function buildOpportunities(polyMarkets, oddsEvents, settings) {
+async function buildOpportunities(polyMarkets, oddsEvents, settings) {
   const results = [];
   const bankroll    = settings.bankroll    ?? 1000;
   const fraction    = settings.kellyFraction ?? 0.5;
@@ -122,12 +128,23 @@ function buildOpportunities(polyMarkets, oddsEvents, settings) {
     multiNoOddsMatch: 0,
     filteredLiquidity:0,
     filteredEv:       0,
+    skippedNonSports: 0,
   };
 
-  for (const market of polyMarkets) {
+  for (let idx = 0; idx < polyMarkets.length; idx++) {
+    // Yield every 20 markets so the browser can handle UI events
+    if (idx > 0 && idx % 20 === 0) await yieldToBrowser();
+
+    const market = polyMarkets[idx];
     const { outcomes, prices } = market;
     if (!outcomes?.length || !prices?.length) continue;
     if (outcomes.length !== prices.length) continue;
+
+    // Skip political, financial, entertainment markets
+    if (!isSportsMarket(market.question)) {
+      stats.skippedNonSports++;
+      continue;
+    }
 
     // Normalise prices — Polymarket sometimes returns strings
     const normPrices = prices.map(Number);

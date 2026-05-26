@@ -413,16 +413,28 @@ function buildAliasMap() {
 
 const ALIAS_MAP = buildAliasMap();
 
+// ── Caches — same names repeat thousands of times across bookmakers ───────────
+const _canonCache  = new Map();
+const _scoreCache  = new Map();
+
 export function canonicalTeamName(raw) {
+  if (_canonCache.has(raw)) return _canonCache.get(raw);
+
   const n = normalize(raw);
-  if (ALIAS_MAP[n]) return ALIAS_MAP[n];
-  // Substring match — require at least 4 chars to avoid false positives
-  if (n.length >= 4) {
+  let result = ALIAS_MAP[n];
+
+  if (!result && n.length >= 4) {
     for (const [key, canonical] of Object.entries(ALIAS_MAP)) {
-      if (key.length >= 4 && (n.includes(key) || key.includes(n))) return canonical;
+      if (key.length >= 4 && (n.includes(key) || key.includes(n))) {
+        result = canonical;
+        break;
+      }
     }
   }
-  return n;
+
+  result = result ?? n;
+  _canonCache.set(raw, result);
+  return result;
 }
 
 // Word-level token overlap — useful for player names (e.g. "Scheffler" vs "S. Scheffler")
@@ -437,21 +449,58 @@ function tokenOverlapScore(a, b) {
 }
 
 // Score how well two team/player names match (0–1)
+// Cached — the same (a,b) pair is checked across many bookmakers/markets.
 export function teamMatchScore(a, b) {
+  // Symmetric key
+  const key = a <= b ? `${a}|||${b}` : `${b}|||${a}`;
+  if (_scoreCache.has(key)) return _scoreCache.get(key);
+
   const ca = canonicalTeamName(a);
   const cb = canonicalTeamName(b);
-  if (ca === cb) return 1;
 
-  const na = normalize(a);
-  const nb = normalize(b);
-  if (na === nb) return 1;
-  if (na.includes(nb) || nb.includes(na)) return 0.85;
+  let score = 0;
+  if (ca === cb) {
+    score = 1;
+  } else {
+    const na = normalize(a);
+    const nb = normalize(b);
+    if (na === nb) {
+      score = 1;
+    } else if (na.includes(nb) || nb.includes(na)) {
+      score = 0.85;
+    } else {
+      const overlap = tokenOverlapScore(a, b);
+      if (overlap >= 0.8)      score = 0.8;
+      else if (overlap >= 0.5) score = 0.65;
+    }
+  }
 
-  const overlap = tokenOverlapScore(a, b);
-  if (overlap >= 0.8) return 0.8;
-  if (overlap >= 0.5) return 0.65;
+  _scoreCache.set(key, score);
+  return score;
+}
 
-  return 0;
+// ── Sports-only market filter ─────────────────────────────────────────────────
+// Rejects political, entertainment, financial, and other non-sports questions.
+const NON_SPORTS_KEYWORDS = [
+  // Politics
+  'president', 'election', 'elect', 'nominee', 'nomination', 'democrat',
+  'republican', 'senate', 'congress', 'house of representatives', 'vote',
+  'voting', 'ballot', 'primary', 'candidate', 'governor', 'mayor', 'minister',
+  'parliament', 'referendum', 'polling', 'impeach', 'inaugur',
+  // Entertainment / awards
+  'oscar', 'emmy', 'grammy', 'golden globe', 'academy award', 'bafta',
+  'celebrity', 'actor', 'actress', 'director', 'film', 'movie', 'album',
+  'song', 'music', 'billboard', 'gramophone', 'reality tv', 'bachelor',
+  // Finance / crypto
+  'bitcoin', 'ethereum', 'crypto', 'stock', 's&p', 'nasdaq', 'dow jones',
+  'fed rate', 'interest rate', 'gdp', 'inflation', 'recession',
+  // Other
+  'spacex', 'rocket', 'launch', 'climate', 'temperature', 'hurricane',
+];
+
+export function isSportsMarket(question) {
+  const q = question.toLowerCase();
+  return !NON_SPORTS_KEYWORDS.some(kw => q.includes(kw));
 }
 
 // Extract the subject team/player from a Polymarket question string.
