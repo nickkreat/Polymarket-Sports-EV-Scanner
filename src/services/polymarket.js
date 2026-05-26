@@ -1,80 +1,82 @@
 const GAMMA_API = 'https://gamma-api.polymarket.com';
+const FETCH_TIMEOUT_MS = 8000;
 
-// All sports/racing tag slugs to fetch from Polymarket
+// Focused list — covers all real Polymarket sports tags without fetching
+// dozens of slugs that return zero results.
 const SPORTS_TAG_SLUGS = [
-  // Team sports
   'nfl', 'nba', 'mlb', 'nhl',
-  // College
-  'ncaa', 'ncaaf', 'ncaab',
-  // Soccer
-  'soccer', 'mls', 'epl', 'champions-league',
-  // Combat sports
-  'ufc', 'boxing', 'mma',
-  // Golf
-  'golf', 'pga', 'masters',
-  // Tennis
-  'tennis', 'atp', 'wta', 'wimbledon', 'us-open',
-  // Motorsport / Racing
-  'racing', 'nascar', 'formula-1', 'f1', 'motorsport',
-  // Catch-all
+  'ncaaf', 'ncaab',
+  'soccer', 'mls',
+  'ufc', 'boxing',
+  'golf', 'tennis', 'racing',
   'sports',
 ];
 
 export async function fetchSportsMarkets(options = {}) {
   const {
-    sports = SPORTS_TAG_SLUGS,
-    limit = 200,
+    sports   = SPORTS_TAG_SLUGS,
+    limit    = 200,
     activeOnly = true,
   } = options;
 
+  // Fetch all tags IN PARALLEL — avoids sequential 28×1-2s waterfall
+  const settled = await Promise.allSettled(
+    sports.map(tag => fetchTag(tag, limit, activeOnly))
+  );
+
+  const seen      = new Set();
   const allMarkets = [];
-  const seen = new Set();
 
-  for (const tag of sports) {
-    const params = new URLSearchParams({
-      tag_slug: tag,
-      active: activeOnly ? 'true' : 'false',
-      closed: 'false',
-      limit: String(limit),
-      offset: '0',
-    });
-
-    try {
-      const res = await fetch(`${GAMMA_API}/markets?${params}`, {
-        headers: { Accept: 'application/json' },
-      });
-
-      if (!res.ok) continue;
-
-      const data = await res.json();
-      const items = Array.isArray(data) ? data : data.markets ?? data.data ?? [];
-
-      for (const m of items) {
-        const id = m.id ?? m.conditionId;
-        if (id && !seen.has(id)) {
-          seen.add(id);
-          allMarkets.push(normalizeMarket(m));
-        }
+  for (const r of settled) {
+    if (r.status !== 'fulfilled') continue;
+    for (const m of r.value) {
+      if (m.id && !seen.has(m.id)) {
+        seen.add(m.id);
+        allMarkets.push(m);
       }
-    } catch {
-      // Skip failed tags silently
     }
   }
 
   return allMarkets;
 }
 
+async function fetchTag(tag, limit, activeOnly) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    const params = new URLSearchParams({
+      tag_slug: tag,
+      active:   activeOnly ? 'true' : 'false',
+      closed:   'false',
+      limit:    String(limit),
+      offset:   '0',
+    });
+
+    const res = await fetch(`${GAMMA_API}/markets?${params}`, {
+      headers: { Accept: 'application/json' },
+      signal:  controller.signal,
+    });
+
+    if (!res.ok) return [];
+
+    const data  = await res.json();
+    const items = Array.isArray(data) ? data : data.markets ?? data.data ?? [];
+    return items.map(normalizeMarket);
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function normalizeMarket(m) {
   let outcomes;
   try {
     outcomes = m.outcomes
-      ? Array.isArray(m.outcomes)
-        ? m.outcomes
-        : JSON.parse(m.outcomes)
+      ? Array.isArray(m.outcomes) ? m.outcomes : JSON.parse(m.outcomes)
       : ['Yes', 'No'];
-  } catch {
-    outcomes = ['Yes', 'No'];
-  }
+  } catch { outcomes = ['Yes', 'No']; }
 
   let prices;
   try {
@@ -83,19 +85,15 @@ function normalizeMarket(m) {
         ? m.outcomePrices.map(Number)
         : JSON.parse(m.outcomePrices).map(Number)
       : outcomes.map(() => 1 / outcomes.length);
-  } catch {
-    prices = outcomes.map(() => 1 / outcomes.length);
-  }
+  } catch { prices = outcomes.map(() => 1 / outcomes.length); }
 
-  const tags = m.tags
-    ? Array.isArray(m.tags)
-      ? m.tags
-      : []
+  const tags = Array.isArray(m.tags)
+    ? m.tags
     : [];
 
   return {
-    id: m.id ?? m.conditionId,
-    question: m.question ?? m.title ?? '',
+    id:        m.id ?? m.conditionId,
+    question:  m.question ?? m.title ?? '',
     description: m.description ?? '',
     outcomes,
     prices,

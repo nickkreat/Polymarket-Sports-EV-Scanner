@@ -1,4 +1,11 @@
 const BASE = 'https://api.the-odds-api.com/v4';
+const FETCH_TIMEOUT_MS = 10000;
+
+function withTimeout(promise, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return promise.finally(() => clearTimeout(timer));
+}
 
 // Confirmed-working core sport keys (always attempted)
 export const CORE_SPORT_KEYS = [
@@ -37,7 +44,10 @@ export async function fetchFuturesOdds(sportKey, apiKey, { regions = 'us,us2', b
 
   if (bookmakers) params.append('bookmakers', bookmakers);
 
-  const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`, { signal: controller.signal })
+    .finally(() => clearTimeout(timer));
 
   if (res.status === 422) {
     // Invalid sport key — return empty quietly; don't throw so the browser
@@ -62,7 +72,10 @@ export async function fetchRelevantSportKeys(apiKey) {
   if (!apiKey) return CORE_SPORT_KEYS;
 
   try {
-    const res = await fetch(`${BASE}/sports?apiKey=${apiKey}&all=true`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const res = await fetch(`${BASE}/sports?apiKey=${apiKey}&all=true`, { signal: controller.signal });
+    clearTimeout(timer);
     if (!res.ok) return CORE_SPORT_KEYS;
 
     const sports = await res.json();
