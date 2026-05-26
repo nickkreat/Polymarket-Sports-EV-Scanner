@@ -1,4 +1,4 @@
-import { ExternalLink, TrendingUp, TrendingDown, Droplets, BarChart3, Calendar, BookOpen } from 'lucide-react';
+import { ExternalLink, Droplets, BarChart3, Calendar, BookOpen, AlertTriangle } from 'lucide-react';
 import { impliedToAmerican } from '../utils/odds';
 
 export default function MarketCard({ opp }) {
@@ -36,6 +36,12 @@ export default function MarketCard({ opp }) {
             {isPositive ? '+' : ''}{opp.evPct.toFixed(1)}%
           </div>
           <div className="text-[10px] text-zinc-500 uppercase tracking-wide">EV</div>
+          {opp.suspiciousEv && (
+            <div className="flex items-center justify-end gap-1 mt-1" title="EV >500% — verify this match manually before betting">
+              <AlertTriangle className="w-3 h-3 text-yellow-500" />
+              <span className="text-[10px] text-yellow-500 font-medium">Verify match</span>
+            </div>
+          )}
         </div>
       </div>
 

@@ -165,7 +165,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         continue;
       }
 
-      const match = findBestOddsMatch(teamFromQuestion, oddsEvents);
+      const match = findBestOddsMatch(teamFromQuestion, oddsEvents, market.tags);
       if (!match) {
         stats.binaryNoOddsMatch++;
         console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamFromQuestion}"`);
@@ -182,6 +182,12 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
       if (!settings.showNegativeEv && bestEv <= 0)  { stats.filteredEv++; continue; }
       if (bestEv < settings.minEvPct)               { stats.filteredEv++; continue; }
+
+      // Flag extreme EV — likely a very stale/illiquid price, not a real edge
+      const suspiciousEv = Math.abs(bestEv) > 500;
+      if (suspiciousEv) {
+        console.warn(`[Scanner] Extreme EV ${bestEv.toFixed(0)}% — verify manually: "${market.question}"`);
+      }
 
       const kellySizing = bestSide === 'YES'
         ? kellySizingYes({ trueProb, marketPrice: yesPrice, bankroll, fraction })
@@ -216,6 +222,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         endDate:    market.endDate,
         event,
         isMultiOutcome: false,
+        suspiciousEv,
       });
 
     } else if (outcomes.length >= 2) {
@@ -229,7 +236,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
         if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
 
-        const match = findBestOddsMatch(outcomeName, oddsEvents);
+        const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags);
         if (!match) {
           stats.multiNoOddsMatch++;
           continue;
@@ -283,12 +290,50 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
   return { results, stats };
 }
 
-// Find the best-matching sportsbook outcome for a given name across all events.
-function findBestOddsMatch(name, oddsEvents) {
+// Map Polymarket tags → Odds API sport_key fragment for context-aware matching.
+function sportKeyFromTags(tags = []) {
+  const t = tags.join(' ').toLowerCase();
+  if (t.includes('nfl'))                              return 'americanfootball_nfl';
+  if (t.includes('ncaaf'))                            return 'americanfootball_ncaaf';
+  if (t.includes('nba'))                              return 'basketball_nba';
+  if (t.includes('ncaab'))                            return 'basketball_ncaab';
+  if (t.includes('mlb'))                              return 'baseball_mlb';
+  if (t.includes('nhl'))                              return 'icehockey_nhl';
+  if (t.includes('soccer') || t.includes('mls') ||
+      t.includes('epl')    || t.includes('champions'))return 'soccer';
+  if (t.includes('ufc')    || t.includes('mma'))      return 'mma';
+  if (t.includes('boxing'))                           return 'boxing';
+  if (t.includes('golf')   || t.includes('pga'))      return 'golf';
+  if (t.includes('tennis') || t.includes('atp') ||
+      t.includes('wta')    || t.includes('wimbledon')) return 'tennis';
+  if (t.includes('nascar') || t.includes('racing'))   return 'nascar';
+  if (t.includes('formula')|| t.includes('f1'))       return 'formula';
+  return null; // unknown sport → search all events
+}
+
+// Find the best-matching sportsbook outcome for a given name.
+// marketTags is used to restrict search to the right sport — prevents a soccer
+// market from accidentally matching a basketball player named "Jordan".
+function findBestOddsMatch(name, oddsEvents, marketTags = []) {
+  const sportHint = sportKeyFromTags(marketTags);
+
+  // Prefer events from the same sport; fall back to all only if no sport events exist.
+  let candidates = oddsEvents;
+  if (sportHint) {
+    const scoped = oddsEvents.filter(e =>
+      e.sport_key?.toLowerCase().includes(sportHint)
+    );
+    if (scoped.length > 0) candidates = scoped;
+  }
+
+  return searchEvents(name, candidates);
+}
+
+function searchEvents(name, events) {
   let bestScore = MIN_MATCH_SCORE - 0.001;
   let bestData  = null;
 
-  for (const event of oddsEvents) {
+  for (const event of events) {
     if (!event.bookmakers?.length) continue;
 
     for (const book of event.bookmakers) {
@@ -297,24 +342,22 @@ function findBestOddsMatch(name, oddsEvents) {
 
         for (const outcome of market.outcomes ?? []) {
           const score = teamMatchScore(name, outcome.name);
-          if (score < MIN_MATCH_SCORE) continue;
+          if (score < MIN_MATCH_SCORE || score <= bestScore) continue;
 
-          if (score > bestScore) {
-            const allBookProbs = collectAllBookProbs(event, outcome.name);
-            if (allBookProbs.length === 0) continue;
+          const allBookProbs = collectAllBookProbs(event, outcome.name);
+          if (allBookProbs.length === 0) continue;
 
-            const trueProb = allBookProbs.reduce((s, p) => s + p, 0) / allBookProbs.length;
+          const trueProb = allBookProbs.reduce((s, p) => s + p, 0) / allBookProbs.length;
 
-            bestScore = score;
-            bestData  = {
-              trueProb,
-              noVigProb:  trueProb,
-              bestBook:   book.title,
-              bestOdds:   outcome.price,
-              totalBooks: allBookProbs.length,
-              event,
-            };
-          }
+          bestScore = score;
+          bestData  = {
+            trueProb,
+            noVigProb:  trueProb,
+            bestBook:   book.title,
+            bestOdds:   outcome.price,
+            totalBooks: allBookProbs.length,
+            event,
+          };
         }
       }
     }
