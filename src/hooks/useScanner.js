@@ -5,7 +5,7 @@ import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
 import { extractTeamFromQuestion, teamMatchScore, isSportsMarket } from '../utils/matching';
 
-const MIN_MATCH_SCORE = 0.6;
+const MIN_MATCH_SCORE = 0.66;
 
 export function useScanner(settings) {
   const [opportunities, setOpportunities]   = useState([]);
@@ -331,6 +331,40 @@ function isChampionshipQuestion(question) {
   return CHAMPIONSHIP_KEYWORDS.some(kw => q.includes(kw));
 }
 
+// Extract sport from question text — fallback when market tags are generic (e.g. 'sports').
+// FIFA/World Cup in question → 'soccer' so "Will Jordan win the World Cup?" never
+// falls back to golf events where "Jordan Spieth" lives.
+function sportKeyFromQuestion(question) {
+  const q = question.toLowerCase();
+  if (q.includes('fifa') || q.includes('world cup') || q.includes('premier league') ||
+      q.includes('champions league') || q.includes('bundesliga') || q.includes('la liga') ||
+      q.includes('serie a') || q.includes('ligue 1') || q.includes('mls cup'))
+    return 'soccer';
+  if (q.includes('super bowl') || q.includes(' nfl ') || q.includes('ncaaf') ||
+      q.includes('college football'))
+    return 'americanfootball';
+  if (q.includes(' nba ') || q.includes('ncaab') || q.includes('basketball'))
+    return 'basketball';
+  if (q.includes('stanley cup') || q.includes(' nhl ') || q.includes('hockey'))
+    return 'icehockey';
+  if (q.includes('world series') || q.includes(' mlb ') || q.includes('baseball'))
+    return 'baseball';
+  if (q.includes(' pga ') || q.includes('lpga') || q.includes('golf') ||
+      q.includes('masters') || q.includes('british open') || q.includes('the open'))
+    return 'golf';
+  if (q.includes('wimbledon') || q.includes('french open') || q.includes('australian open') ||
+      q.includes(' atp ') || q.includes(' wta ') || q.includes('tennis'))
+    return 'tennis';
+  if (q.includes(' ufc ') || q.includes('mma') || q.includes('mixed martial'))
+    return 'mma';
+  if (q.includes('boxing') || q.includes(' wbc ') || q.includes(' wbo ') || q.includes(' wba '))
+    return 'boxing';
+  if (q.includes('nascar') || q.includes('formula 1') || q.includes(' f1 ') ||
+      q.includes('grand prix') || q.includes('indy 500') || q.includes('daytona'))
+    return 'nascar';
+  return null;
+}
+
 // Map Polymarket tags → Odds API sport_key fragment for context-aware matching.
 function sportKeyFromTags(tags = []) {
   const t = tags.join(' ').toLowerCase();
@@ -353,23 +387,30 @@ function sportKeyFromTags(tags = []) {
 }
 
 // Find the best-matching sportsbook outcome for a given name.
-// question is used to detect championship vs game-level context.
-// marketTags restricts search to the right sport.
+// question drives both championship detection and sport-context derivation.
 function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
-  const sportHint  = sportKeyFromTags(marketTags);
-  // Championship / futures questions must only match outright markets.
-  // Game questions (no championship keyword) can also match h2h.
-  const allowedKeys = isChampionshipQuestion(question)
-    ? ['outrights']
-    : ['outrights', 'h2h'];
+  const isChampionship = isChampionshipQuestion(question);
+  const allowedKeys = isChampionship ? ['outrights'] : ['outrights', 'h2h'];
 
-  // Prefer events from the same sport; fall back to all only if no sport events exist.
+  // Use tag-based hint first; fall back to question-text-based hint.
+  // The question fallback is critical for markets tagged only as 'sports' —
+  // "Will Jordan win the 2026 FIFA World Cup?" → 'soccer' from question text
+  // prevents "Jordan" matching "Jordan Spieth" in golf events.
+  const sportHint = sportKeyFromTags(marketTags) || sportKeyFromQuestion(question);
+
   let candidates = oddsEvents;
   if (sportHint) {
     const scoped = oddsEvents.filter(e =>
       e.sport_key?.toLowerCase().includes(sportHint)
     );
-    if (scoped.length > 0) candidates = scoped;
+    if (scoped.length > 0) {
+      candidates = scoped;
+    } else if (isChampionship) {
+      // Championship + known sport but zero sportsbook events for that sport:
+      // do NOT fall back to all events — cross-sport false positives are worse
+      // than missing a result.
+      return null;
+    }
   }
 
   return searchEvents(name, candidates, allowedKeys);

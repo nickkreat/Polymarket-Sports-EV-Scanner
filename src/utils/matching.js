@@ -466,12 +466,19 @@ export function teamMatchScore(a, b) {
     const nb = normalize(b);
     if (na === nb) {
       score = 1;
-    } else if (na.includes(nb) || nb.includes(na)) {
-      score = 0.85;
     } else {
-      const overlap = tokenOverlapScore(a, b);
-      if (overlap >= 0.8)      score = 0.8;
-      else if (overlap >= 0.5) score = 0.65;
+      // Require the shorter string to be >= 50% the length of the longer before
+      // awarding a substring-match bonus.  Without this, "jordan" (6 chars)
+      // would score 0.85 against "jordan spieth" (13 chars).
+      const longer  = Math.max(na.length, nb.length);
+      const shorter = Math.min(na.length, nb.length);
+      if (shorter / longer >= 0.5 && (na.includes(nb) || nb.includes(na))) {
+        score = 0.85;
+      } else {
+        const overlap = tokenOverlapScore(a, b);
+        if (overlap >= 0.8)      score = 0.8;
+        else if (overlap >= 0.5) score = 0.65;
+      }
     }
   }
 
@@ -507,10 +514,14 @@ export function isSportsMarket(question) {
 // Returns the canonical name, or null if no pattern matched.
 export function extractTeamFromQuestion(question) {
   const patterns = [
-    // "Will the Kansas City Chiefs win the Super Bowl?"
+    // "Will the Heat beat the Celtics?" / "Will Miami defeat Boston?"
+    /will (?:the )?(.+?) (?:beat|defeat|overcome|outperform|top)/i,
+    // "Will the Kansas City Chiefs win the Super Bowl?" / "...win tonight?"
     /will (?:the )?(.+?) (?:win|make|reach|advance|be named|finish|clinch|capture|claim)/i,
-    // "Kansas City Chiefs to win the Super Bowl"
-    /(?:the )?(.+?) to (?:win|make|reach|advance|qualify|clinch)/i,
+    // "Kansas City Chiefs to win the Super Bowl" / "Heat to win Game 1"
+    /(?:the )?(.+?) to (?:win|beat|defeat|make|reach|advance|qualify|clinch)/i,
+    // "Heat vs Celtics" — extract the first team (away or favourite listed first)
+    /^(?:the )?(.+?) vs\.? (?:the )?/i,
     // "Will the Chiefs win the championship/title"
     /(?:^|will )(?:the )?(.+?) (?:win|championship|title|cup|trophy)/i,
     // "Kansas City Chiefs Super Bowl winner?"
