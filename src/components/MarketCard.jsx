@@ -6,6 +6,17 @@ export default function MarketCard({ opp }) {
   const evClass = isPositive ? 'text-ev-positive' : 'text-ev-negative';
   const bgClass = isPositive ? 'bg-ev-positive border-ev-positive' : 'bg-ev-negative border-ev-negative';
 
+  // Multi-outcome markets use a player/team name as `side` instead of YES/NO
+  const isSideYes = opp.side === 'YES';
+  const isSideNo  = opp.side === 'NO';
+  const isNamedOutcome = !isSideYes && !isSideNo;
+
+  const sideBadgeClass = isSideNo
+    ? 'bg-red-500/10 text-red-400 border-red-500/20'
+    : 'bg-green-500/10 text-green-400 border-green-500/20';
+
+  const sideLabel = isNamedOutcome ? opp.side : `BUY ${opp.side}`;
+
   return (
     <div className={`rounded-xl border p-4 transition-colors hover:bg-[#1e1e21] ${bgClass} bg-[#18181b]`}>
       {/* Top row: sport badge + EV */}
@@ -14,12 +25,9 @@ export default function MarketCard({ opp }) {
           <span className="px-2 py-0.5 rounded-md text-xs font-medium bg-zinc-800 text-zinc-300 border border-zinc-700">
             {opp.sport}
           </span>
-          <span className={`px-2 py-0.5 rounded-md text-xs font-bold border ${
-            opp.side === 'YES'
-              ? 'bg-green-500/10 text-green-400 border-green-500/20'
-              : 'bg-red-500/10 text-red-400 border-red-500/20'
-          }`}>
-            BUY {opp.side}
+          <span className={`px-2 py-0.5 rounded-md text-xs font-bold border ${sideBadgeClass}`}
+            title={isNamedOutcome ? `Buy "${opp.side}" to win` : undefined}>
+            {sideLabel}
           </span>
         </div>
 
@@ -48,8 +56,8 @@ export default function MarketCard({ opp }) {
       <div className="grid grid-cols-2 gap-2 mb-4">
         <ProbBox
           label="Polymarket"
-          price={opp.side === 'YES' ? opp.yesPrice : opp.noPrice}
-          sublabel={`${opp.side} price`}
+          price={opp.marketPrice}
+          sublabel={isNamedOutcome ? 'outcome price' : `${opp.side} price`}
           color="zinc"
         />
         <ProbBox

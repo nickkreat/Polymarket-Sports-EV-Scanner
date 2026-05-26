@@ -1,6 +1,6 @@
 import { Search, SlidersHorizontal } from 'lucide-react';
 
-const SPORTS = ['All', 'NFL', 'NBA', 'MLB', 'NHL', 'NCAAF', 'NCAAB', 'Soccer', 'UFC/MMA'];
+const SPORTS = ['All', 'NFL', 'NBA', 'MLB', 'NHL', 'NCAAF', 'NCAAB', 'Soccer', 'Golf', 'Tennis', 'Racing', 'UFC/MMA', 'Boxing'];
 const SORT_OPTIONS = [
   { value: 'ev_desc', label: 'EV: High → Low' },
   { value: 'ev_asc', label: 'EV: Low → High' },

@@ -1,20 +1,33 @@
 const GAMMA_API = 'https://gamma-api.polymarket.com';
 
+// All sports/racing tag slugs to fetch from Polymarket
 const SPORTS_TAG_SLUGS = [
-  'nfl', 'nba', 'mlb', 'nhl', 'ncaa', 'soccer', 'sports',
-  'mls', 'ncaaf', 'ncaab', 'ufc', 'boxing',
+  // Team sports
+  'nfl', 'nba', 'mlb', 'nhl',
+  // College
+  'ncaa', 'ncaaf', 'ncaab',
+  // Soccer
+  'soccer', 'mls', 'epl', 'champions-league',
+  // Combat sports
+  'ufc', 'boxing', 'mma',
+  // Golf
+  'golf', 'pga', 'masters',
+  // Tennis
+  'tennis', 'atp', 'wta', 'wimbledon', 'us-open',
+  // Motorsport / Racing
+  'racing', 'nascar', 'formula-1', 'f1', 'motorsport',
+  // Catch-all
+  'sports',
 ];
 
 export async function fetchSportsMarkets(options = {}) {
   const {
     sports = SPORTS_TAG_SLUGS,
-    limit = 100,
+    limit = 200,
     activeOnly = true,
   } = options;
 
   const allMarkets = [];
-
-  // Fetch each tag; dedupe by market id
   const seen = new Set();
 
   for (const tag of sports) {
@@ -52,17 +65,27 @@ export async function fetchSportsMarkets(options = {}) {
 }
 
 function normalizeMarket(m) {
-  const outcomes = m.outcomes
-    ? Array.isArray(m.outcomes)
-      ? m.outcomes
-      : JSON.parse(m.outcomes)
-    : ['Yes', 'No'];
+  let outcomes;
+  try {
+    outcomes = m.outcomes
+      ? Array.isArray(m.outcomes)
+        ? m.outcomes
+        : JSON.parse(m.outcomes)
+      : ['Yes', 'No'];
+  } catch {
+    outcomes = ['Yes', 'No'];
+  }
 
-  const prices = m.outcomePrices
-    ? Array.isArray(m.outcomePrices)
-      ? m.outcomePrices.map(Number)
-      : JSON.parse(m.outcomePrices).map(Number)
-    : [0.5, 0.5];
+  let prices;
+  try {
+    prices = m.outcomePrices
+      ? Array.isArray(m.outcomePrices)
+        ? m.outcomePrices.map(Number)
+        : JSON.parse(m.outcomePrices).map(Number)
+      : outcomes.map(() => 1 / outcomes.length);
+  } catch {
+    prices = outcomes.map(() => 1 / outcomes.length);
+  }
 
   const tags = m.tags
     ? Array.isArray(m.tags)
@@ -75,15 +98,15 @@ function normalizeMarket(m) {
     question: m.question ?? m.title ?? '',
     description: m.description ?? '',
     outcomes,
-    prices, // [yesPrice, noPrice]
-    volume: parseFloat(m.volume ?? m.volumeNum ?? 0),
+    prices,
+    volume:    parseFloat(m.volume    ?? m.volumeNum    ?? 0),
     liquidity: parseFloat(m.liquidity ?? m.liquidityNum ?? 0),
-    endDate: m.endDate ?? m.endDateIso ?? null,
-    active: m.active ?? true,
-    closed: m.closed ?? false,
-    tags: tags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
-    url: m.url ?? `https://polymarket.com/event/${m.slug ?? m.id}`,
-    slug: m.slug ?? '',
+    endDate:   m.endDate ?? m.endDateIso ?? null,
+    active:    m.active  ?? true,
+    closed:    m.closed  ?? false,
+    tags:      tags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
+    url:       m.url ?? `https://polymarket.com/event/${m.slug ?? m.id}`,
+    slug:      m.slug ?? '',
   };
 }
 

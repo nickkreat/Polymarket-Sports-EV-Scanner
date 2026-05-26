@@ -7,7 +7,7 @@ const DEFAULTS = {
   bankroll: 1000,
   kellyFraction: 0.5,
   minEvPct: 5,
-  minLiquidity: 1000,
+  minLiquidity: 500,
   minVolume: 0,
   autoRefresh: false,
   refreshIntervalMin: 5,
