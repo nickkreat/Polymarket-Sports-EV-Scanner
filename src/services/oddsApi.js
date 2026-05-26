@@ -119,6 +119,7 @@ export async function fetchAllFuturesOdds(apiKey, sportKeys = CORE_SPORT_KEYS, o
 
 /**
  * Fetch H2H odds for a sport (game-level markets).
+ * Returns [] on 422/404 and on network error so callers stay clean.
  */
 export async function fetchH2HOdds(sportKey, apiKey, { regions = 'us,us2' } = {}) {
   if (!apiKey) throw new Error('No Odds API key configured');
@@ -130,9 +131,36 @@ export async function fetchH2HOdds(sportKey, apiKey, { regions = 'us,us2' } = {}
     oddsFormat: 'american',
   });
 
-  const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`);
-  if (!res.ok) throw new Error(`Odds API ${res.status}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`, { signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+
+  if (res.status === 422 || res.status === 404) return [];
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Odds API ${res.status} for ${sportKey} h2h: ${body}`);
+  }
+
   return res.json();
+}
+
+/**
+ * Fetch H2H (game-level) odds for a list of sport keys in parallel.
+ * Returns a flat list of game event objects, each with market.key === 'h2h'.
+ */
+export async function fetchAllH2HOdds(apiKey, sportKeys = CORE_SPORT_KEYS, options = {}) {
+  const results = await Promise.allSettled(
+    sportKeys.map(sk => fetchH2HOdds(sk, apiKey, options))
+  );
+
+  const events = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      events.push(...r.value);
+    }
+  }
+  return events;
 }
 
 /**

@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { fetchSportsMarkets } from '../services/polymarket';
-import { fetchAllFuturesOdds, fetchRelevantSportKeys } from '../services/oddsApi';
+import { fetchAllFuturesOdds, fetchAllH2HOdds, fetchRelevantSportKeys, CORE_SPORT_KEYS } from '../services/oddsApi';
 import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
 import { extractTeamFromQuestion, teamMatchScore, isSportsMarket } from '../utils/matching';
@@ -45,17 +45,29 @@ export function useScanner(settings) {
       const sportKeys = await fetchRelevantSportKeys(settings.oddsApiKey);
       console.debug(`[Scanner] Sport keys to fetch (${sportKeys.length}):`, sportKeys);
 
-      setStatus('scanning — fetching sportsbook odds…');
-      const oddsEvents = await fetchAllFuturesOdds(
+      setStatus('scanning — fetching sportsbook futures odds…');
+      const futuresEvents = await fetchAllFuturesOdds(
         settings.oddsApiKey,
         sportKeys,
         { regions: settings.preferredRegions }
       );
-      console.debug(`[Scanner] Odds API: fetched ${oddsEvents.length} events`);
+      console.debug(`[Scanner] Odds API futures: ${futuresEvents.length} events`);
+
+      setStatus('scanning — fetching sportsbook game odds…');
+      const h2hEvents = await fetchAllH2HOdds(
+        settings.oddsApiKey,
+        CORE_SPORT_KEYS,
+        { regions: settings.preferredRegions }
+      );
+      console.debug(`[Scanner] Odds API H2H: ${h2hEvents.length} game events`);
+
+      const oddsEvents = [...futuresEvents, ...h2hEvents];
+      console.debug(`[Scanner] Odds API total: ${oddsEvents.length} events (${futuresEvents.length} futures + ${h2hEvents.length} games)`);
       if (oddsEvents.length > 0) {
         console.debug('[Scanner] Sample events:', oddsEvents.slice(0, 3).map(e => ({
           sport: e.sport_key,
           books: e.bookmakers?.length,
+          marketTypes: [...new Set(e.bookmakers?.flatMap(b => b.markets?.map(m => m.key) ?? []))],
           sampleOutcomes: e.bookmakers?.[0]?.markets?.[0]?.outcomes?.slice(0, 3).map(o => o.name),
         })));
       }
@@ -70,6 +82,8 @@ export function useScanner(settings) {
       setScanStats({
         polyMarketsScanned:       polyMarkets.length,
         oddsEventsScanned:        oddsEvents.length,
+        futuresEventsScanned:     futuresEvents.length,
+        h2hEventsScanned:         h2hEvents.length,
         skippedNonSports:         stats.skippedNonSports,
         binaryMarketsChecked:     stats.binaryChecked,
         binaryNoQuestionMatch:    stats.binaryNoQuestion,
@@ -338,7 +352,7 @@ function searchEvents(name, events) {
 
     for (const book of event.bookmakers) {
       for (const market of book.markets ?? []) {
-        if (market.key !== 'outrights') continue;
+        if (market.key !== 'outrights' && market.key !== 'h2h') continue;
 
         for (const outcome of market.outcomes ?? []) {
           const score = teamMatchScore(name, outcome.name);
@@ -356,11 +370,22 @@ function searchEvents(name, events) {
             bestBook:   book.title,
             bestOdds:   outcome.price,
             totalBooks: allBookProbs.length,
+            matchScore: score,
+            matchedOutcome: outcome.name,
+            matchMarketType: market.key,
             event,
           };
         }
       }
     }
+  }
+
+  if (bestData) {
+    console.debug(
+      `[Match] "${name}" → "${bestData.matchedOutcome}" (score=${bestData.matchScore.toFixed(2)}, ` +
+      `type=${bestData.matchMarketType}, sport=${bestData.event?.sport_key}, ` +
+      `trueProb=${(bestData.trueProb * 100).toFixed(1)}%, books=${bestData.totalBooks})`
+    );
   }
 
   return bestData;
@@ -372,7 +397,7 @@ function collectAllBookProbs(event, targetOutcomeName) {
 
   for (const book of event.bookmakers ?? []) {
     for (const market of book.markets ?? []) {
-      if (market.key !== 'outrights') continue;
+      if (market.key !== 'outrights' && market.key !== 'h2h') continue;
 
       const outcomes     = market.outcomes ?? [];
       const impliedProbs = outcomes.map(o => americanToImplied(o.price));
