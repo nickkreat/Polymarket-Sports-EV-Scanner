@@ -179,7 +179,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         continue;
       }
 
-      const match = findBestOddsMatch(teamFromQuestion, oddsEvents, market.tags);
+      const match = findBestOddsMatch(teamFromQuestion, oddsEvents, market.tags, market.question);
       if (!match) {
         stats.binaryNoOddsMatch++;
         console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamFromQuestion}"`);
@@ -250,7 +250,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
         if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
 
-        const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags);
+        const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question);
         if (!match) {
           stats.multiNoOddsMatch++;
           continue;
@@ -304,6 +304,33 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
   return { results, stats };
 }
 
+// ── Championship vs game-level question detection ─────────────────────────────
+// If the question mentions a season/tournament winner event, restrict matching
+// to sportsbook outrights only.  Game-level questions can also use h2h odds.
+const CHAMPIONSHIP_KEYWORDS = [
+  // Major championship events
+  'stanley cup', 'super bowl', 'nba finals', 'nba championship',
+  'world series', 'world cup', 'champions league', 'premier league',
+  'fa cup', 'mls cup', 'championship',
+  'ncaa tournament', 'march madness', 'college football playoff',
+  'pennant', 'division title', 'division winner', 'conference title',
+  'conference champion', 'nfl champion',
+  // Individual sport majors
+  'masters', 'us open', 'british open', 'the open championship',
+  'pga championship', 'wimbledon', 'french open', 'australian open',
+  'grand slam', 'daytona 500', 'indy 500', 'monaco grand prix',
+  // Award / season-long markets
+  'season mvp', 'league mvp', 'mvp award', 'cy young', 'heisman',
+  'ballon d\'or', 'rookie of the year',
+  // Generic season-winner phrases
+  'win the league', 'win the title', 'win the cup', 'win the series',
+];
+
+function isChampionshipQuestion(question) {
+  const q = question.toLowerCase();
+  return CHAMPIONSHIP_KEYWORDS.some(kw => q.includes(kw));
+}
+
 // Map Polymarket tags → Odds API sport_key fragment for context-aware matching.
 function sportKeyFromTags(tags = []) {
   const t = tags.join(' ').toLowerCase();
@@ -326,10 +353,15 @@ function sportKeyFromTags(tags = []) {
 }
 
 // Find the best-matching sportsbook outcome for a given name.
-// marketTags is used to restrict search to the right sport — prevents a soccer
-// market from accidentally matching a basketball player named "Jordan".
-function findBestOddsMatch(name, oddsEvents, marketTags = []) {
-  const sportHint = sportKeyFromTags(marketTags);
+// question is used to detect championship vs game-level context.
+// marketTags restricts search to the right sport.
+function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
+  const sportHint  = sportKeyFromTags(marketTags);
+  // Championship / futures questions must only match outright markets.
+  // Game questions (no championship keyword) can also match h2h.
+  const allowedKeys = isChampionshipQuestion(question)
+    ? ['outrights']
+    : ['outrights', 'h2h'];
 
   // Prefer events from the same sport; fall back to all only if no sport events exist.
   let candidates = oddsEvents;
@@ -340,10 +372,10 @@ function findBestOddsMatch(name, oddsEvents, marketTags = []) {
     if (scoped.length > 0) candidates = scoped;
   }
 
-  return searchEvents(name, candidates);
+  return searchEvents(name, candidates, allowedKeys);
 }
 
-function searchEvents(name, events) {
+function searchEvents(name, events, allowedKeys = ['outrights', 'h2h']) {
   let bestScore = MIN_MATCH_SCORE - 0.001;
   let bestData  = null;
 
@@ -352,13 +384,13 @@ function searchEvents(name, events) {
 
     for (const book of event.bookmakers) {
       for (const market of book.markets ?? []) {
-        if (market.key !== 'outrights' && market.key !== 'h2h') continue;
+        if (!allowedKeys.includes(market.key)) continue;
 
         for (const outcome of market.outcomes ?? []) {
           const score = teamMatchScore(name, outcome.name);
           if (score < MIN_MATCH_SCORE || score <= bestScore) continue;
 
-          const allBookProbs = collectAllBookProbs(event, outcome.name);
+          const allBookProbs = collectAllBookProbs(event, outcome.name, allowedKeys);
           if (allBookProbs.length === 0) continue;
 
           const trueProb = allBookProbs.reduce((s, p) => s + p, 0) / allBookProbs.length;
@@ -392,12 +424,12 @@ function searchEvents(name, events) {
 }
 
 // Collect devigged probabilities for a named outcome across all bookmakers in an event.
-function collectAllBookProbs(event, targetOutcomeName) {
+function collectAllBookProbs(event, targetOutcomeName, allowedKeys = ['outrights', 'h2h']) {
   const devigged = [];
 
   for (const book of event.bookmakers ?? []) {
     for (const market of book.markets ?? []) {
-      if (market.key !== 'outrights' && market.key !== 'h2h') continue;
+      if (!allowedKeys.includes(market.key)) continue;
 
       const outcomes     = market.outcomes ?? [];
       const impliedProbs = outcomes.map(o => americanToImplied(o.price));
