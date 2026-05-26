@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    background-color: #0a0a0b;
+    color: #e4e4e7;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #root {
+    width: 100%;
+    max-width: 100%;
+    text-align: left;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #111113; }
+  ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+}
+
+@layer components {
+  .input {
+    @apply w-full bg-[#18181b] border border-[#27272a] rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-zinc-500 transition-colors;
+  }
+}
+
+@layer utilities {
+  .text-ev-positive { color: #22c55e; }
+  .text-ev-negative { color: #ef4444; }
+  .text-ev-neutral  { color: #a1a1aa; }
+  .bg-ev-positive   { background-color: rgba(34, 197, 94, 0.10); }
+  .bg-ev-negative   { background-color: rgba(239, 68, 68, 0.10); }
+  .border-ev-positive { border-color: rgba(34, 197, 94, 0.25); }
+  .border-ev-negative { border-color: rgba(239, 68, 68, 0.25); }
+}
