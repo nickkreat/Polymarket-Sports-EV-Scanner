@@ -5,7 +5,6 @@ import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
 import { extractTeamFromQuestion, teamMatchScore } from '../utils/matching';
 
-// Minimum match confidence to accept (lowered from 0.7 to catch player-name variations)
 const MIN_MATCH_SCORE = 0.6;
 
 export function useScanner(settings) {
@@ -32,10 +31,15 @@ export function useScanner(settings) {
     setStatus('scanning');
     setError(null);
     setOpportunities([]);
+    setScanStats(null);
 
     try {
       setStatus('scanning — fetching Polymarket sports markets…');
       const polyMarkets = await fetchSportsMarkets({ limit: 200 });
+      console.debug(`[Scanner] Polymarket: fetched ${polyMarkets.length} markets`);
+      if (polyMarkets.length > 0) {
+        console.debug('[Scanner] Sample questions:', polyMarkets.slice(0, 5).map(m => m.question));
+      }
 
       setStatus('scanning — fetching sportsbook odds…');
       const oddsEvents = await fetchAllFuturesOdds(
@@ -43,21 +47,39 @@ export function useScanner(settings) {
         ALL_SPORT_KEYS,
         { regions: settings.preferredRegions }
       );
+      console.debug(`[Scanner] Odds API: fetched ${oddsEvents.length} events`);
+      if (oddsEvents.length > 0) {
+        console.debug('[Scanner] Sample events:', oddsEvents.slice(0, 3).map(e => ({
+          sport: e.sport_key,
+          books: e.bookmakers?.length,
+          sampleOutcomes: e.bookmakers?.[0]?.markets?.[0]?.outcomes?.slice(0, 3).map(o => o.name),
+        })));
+      }
 
       setStatus('scanning — computing EV…');
-      const results = buildOpportunities(polyMarkets, oddsEvents, settings);
+      const { results, stats } = buildOpportunities(polyMarkets, oddsEvents, settings);
+      console.debug('[Scanner] Match stats:', stats);
+      console.debug(`[Scanner] Found ${results.length} opportunities`);
 
       setOpportunities(results);
       setLastScanned(new Date());
       setScanStats({
-        polyMarketsScanned: polyMarkets.length,
-        oddsEventsScanned:  oddsEvents.length,
-        matchedMarkets:     results.length,
-        positiveEv:         results.filter(r => r.evPct > 0).length,
+        polyMarketsScanned:  polyMarkets.length,
+        oddsEventsScanned:   oddsEvents.length,
+        binaryMarketsChecked:     stats.binaryChecked,
+        binaryNoQuestionMatch:    stats.binaryNoQuestion,
+        binaryNoOddsMatch:        stats.binaryNoOddsMatch,
+        multiOutcomesChecked:     stats.multiChecked,
+        multiNoOddsMatch:         stats.multiNoOddsMatch,
+        filteredByLiquidity:      stats.filteredLiquidity,
+        filteredByEv:             stats.filteredEv,
+        matchedMarkets:   results.length,
+        positiveEv:       results.filter(r => r.evPct > 0).length,
       });
       setStatus('done');
     } catch (err) {
       if (err.name === 'AbortError') return;
+      console.error('[Scanner] Error:', err);
       setError(err.message ?? 'Unknown error during scan');
       setStatus('error');
     }
@@ -71,11 +93,11 @@ export function useScanner(settings) {
   return { opportunities, status, error, lastScanned, scanStats, quotaRemaining, scan, stop };
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isBinaryYesNo(outcomes) {
   if (outcomes.length !== 2) return false;
-  const lower = outcomes.map(o => o.toLowerCase().trim());
+  const lower = outcomes.map(o => String(o).toLowerCase().trim());
   return lower.includes('yes') && lower.includes('no');
 }
 
@@ -87,55 +109,72 @@ function buildOpportunities(polyMarkets, oddsEvents, settings) {
   const fraction    = settings.kellyFraction ?? 0.5;
   const maxKellyPct = (settings.maxKellyPct ?? 25) / 100;
 
-  for (const market of polyMarkets) {
-    if (market.closed || !market.active) continue;
+  // Per-step diagnostic counters
+  const stats = {
+    binaryChecked:    0,
+    binaryNoQuestion: 0,
+    binaryNoOddsMatch:0,
+    multiChecked:     0,
+    multiNoOddsMatch: 0,
+    filteredLiquidity:0,
+    filteredEv:       0,
+  };
 
+  for (const market of polyMarkets) {
     const { outcomes, prices } = market;
     if (!outcomes?.length || !prices?.length) continue;
     if (outcomes.length !== prices.length) continue;
 
+    // Normalise prices — Polymarket sometimes returns strings
+    const normPrices = prices.map(Number);
+
     if (isBinaryYesNo(outcomes)) {
-      // ── Binary YES/NO market ─────────────────────────────────────────────
-      const yesIdx = outcomes.findIndex(o => o.toLowerCase() === 'yes');
-      const yesPrice = prices[yesIdx >= 0 ? yesIdx : 0];
-      const noPrice  = prices[yesIdx >= 0 ? 1 - yesIdx : 1];
+      // ── Binary YES/NO market ───────────────────────────────────────────────
+      stats.binaryChecked++;
+
+      const yesIdx   = outcomes.findIndex(o => String(o).toLowerCase() === 'yes');
+      const yesPrice = normPrices[yesIdx >= 0 ? yesIdx : 0];
+      const noPrice  = normPrices[yesIdx >= 0 ? 1 - yesIdx : 1];
 
       if (!yesPrice || yesPrice <= 0 || yesPrice >= 1) continue;
 
       const teamFromQuestion = extractTeamFromQuestion(market.question);
-      if (!teamFromQuestion) continue;
+      if (!teamFromQuestion) {
+        stats.binaryNoQuestion++;
+        continue;
+      }
 
       const match = findBestOddsMatch(teamFromQuestion, oddsEvents);
-      if (!match) continue;
+      if (!match) {
+        stats.binaryNoOddsMatch++;
+        console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamFromQuestion}"`);
+        continue;
+      }
 
       const { trueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
 
-      const yesEv = evPercent(trueProb, yesPrice);
-      const noEv  = evPercent(1 - trueProb, noPrice);
+      const yesEv    = evPercent(trueProb, yesPrice);
+      const noEv     = evPercent(1 - trueProb, noPrice);
+      const bestSide = yesEv >= noEv ? 'YES' : 'NO';
+      const bestEv   = bestSide === 'YES' ? yesEv : noEv;
 
-      const bestSide  = yesEv >= noEv ? 'YES' : 'NO';
-      const bestEv    = bestSide === 'YES' ? yesEv : noEv;
-      const bestPrice = bestSide === 'YES' ? yesPrice : noPrice;
+      if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
+      if (!settings.showNegativeEv && bestEv <= 0)  { stats.filteredEv++; continue; }
+      if (bestEv < settings.minEvPct)               { stats.filteredEv++; continue; }
 
-      if (!settings.showNegativeEv && bestEv <= 0) continue;
-      if (bestEv < settings.minEvPct) continue;
-      if (market.liquidity < settings.minLiquidity) continue;
-
-      const kellySizing =
-        bestSide === 'YES'
-          ? kellySizingYes({ trueProb, marketPrice: yesPrice, bankroll, fraction })
-          : kellySizingNo({ trueProb, marketPrice: noPrice, bankroll, fraction });
-
+      const kellySizing = bestSide === 'YES'
+        ? kellySizingYes({ trueProb, marketPrice: yesPrice, bankroll, fraction })
+        : kellySizingNo({ trueProb, marketPrice: noPrice, bankroll, fraction });
       const cappedPct = Math.min(kellySizing.adjustedPct, maxKellyPct);
 
       results.push({
         id: market.id,
         question: market.question,
-        url: market.url,
+        url:  market.url,
         sport: inferSport(market.tags, event?.sport_key),
-        side: bestSide,
+        side:  bestSide,
         evPct: bestEv,
-        marketPrice: bestPrice,
+        marketPrice: bestSide === 'YES' ? yesPrice : noPrice,
         trueProb,
         noVigProb,
         yesPrice,
@@ -151,34 +190,36 @@ function buildOpportunities(polyMarkets, oddsEvents, settings) {
           betSize:      cappedPct * bankroll,
           fraction,
         },
-        liquidity: market.liquidity,
-        volume:    market.volume,
-        endDate:   market.endDate,
+        liquidity:  market.liquidity,
+        volume:     market.volume,
+        endDate:    market.endDate,
         event,
         isMultiOutcome: false,
       });
-    } else {
-      // ── Multi-outcome market (e.g. "Who wins the Masters?") ──────────────
-      // Each outcome is a player/team name with its own price.
-      // We treat each as a separate "buy this outcome" opportunity.
-      for (let i = 0; i < outcomes.length; i++) {
-        const outcomeName  = outcomes[i];
-        const outcomePrice = prices[i];
 
-        if (!outcomeName || typeof outcomeName !== 'string') continue;
+    } else if (outcomes.length >= 2) {
+      // ── Multi-outcome market (e.g. "Who wins the Masters?") ───────────────
+      // Each outcome IS the player/team name; treat each as a separate bet.
+      for (let i = 0; i < outcomes.length; i++) {
+        stats.multiChecked++;
+        const outcomeName  = String(outcomes[i]);
+        const outcomePrice = normPrices[i];
+
+        if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
         if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
 
         const match = findBestOddsMatch(outcomeName, oddsEvents);
-        if (!match) continue;
+        if (!match) {
+          stats.multiNoOddsMatch++;
+          continue;
+        }
 
         const { trueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
-
-        // Buying this outcome at outcomePrice — EV vs sportsbook consensus
         const ev = evPercent(trueProb, outcomePrice);
 
-        if (!settings.showNegativeEv && ev <= 0) continue;
-        if (ev < settings.minEvPct) continue;
-        if (market.liquidity < settings.minLiquidity) continue;
+        if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
+        if (!settings.showNegativeEv && ev <= 0)      { stats.filteredEv++; continue; }
+        if (ev < settings.minEvPct)                   { stats.filteredEv++; continue; }
 
         const kellySizing = kellySizingYes({ trueProb, marketPrice: outcomePrice, bankroll, fraction });
         const cappedPct   = Math.min(kellySizing.adjustedPct, maxKellyPct);
@@ -206,24 +247,24 @@ function buildOpportunities(polyMarkets, oddsEvents, settings) {
             betSize:      cappedPct * bankroll,
             fraction,
           },
-          liquidity: market.liquidity,
-          volume:    market.volume,
-          endDate:   market.endDate,
+          liquidity:  market.liquidity,
+          volume:     market.volume,
+          endDate:    market.endDate,
           event,
           isMultiOutcome: true,
-          outcomeLabel:   outcomeName,
+          outcomeLabel: outcomeName,
         });
       }
     }
   }
 
   results.sort((a, b) => b.evPct - a.evPct);
-  return results;
+  return { results, stats };
 }
 
 // Find the best-matching sportsbook outcome for a given name across all events.
 function findBestOddsMatch(name, oddsEvents) {
-  let bestScore = MIN_MATCH_SCORE - 0.001; // must beat threshold
+  let bestScore = MIN_MATCH_SCORE - 0.001;
   let bestData  = null;
 
   for (const event of oddsEvents) {
@@ -238,7 +279,6 @@ function findBestOddsMatch(name, oddsEvents) {
           if (score < MIN_MATCH_SCORE) continue;
 
           if (score > bestScore) {
-            // Build consensus probability from all books for this outcome
             const allBookProbs = collectAllBookProbs(event, outcome.name);
             if (allBookProbs.length === 0) continue;
 
@@ -247,9 +287,9 @@ function findBestOddsMatch(name, oddsEvents) {
             bestScore = score;
             bestData  = {
               trueProb,
-              noVigProb: trueProb,
-              bestBook:  book.title,
-              bestOdds:  outcome.price,
+              noVigProb:  trueProb,
+              bestBook:   book.title,
+              bestOdds:   outcome.price,
               totalBooks: allBookProbs.length,
               event,
             };
@@ -262,8 +302,7 @@ function findBestOddsMatch(name, oddsEvents) {
   return bestData;
 }
 
-// Collect devigged probabilities for a named outcome across every bookmaker
-// in a single event, then return them as an array (one entry per book).
+// Collect devigged probabilities for a named outcome across all bookmakers in an event.
 function collectAllBookProbs(event, targetOutcomeName) {
   const devigged = [];
 
@@ -271,9 +310,9 @@ function collectAllBookProbs(event, targetOutcomeName) {
     for (const market of book.markets ?? []) {
       if (market.key !== 'outrights') continue;
 
-      const outcomes = market.outcomes ?? [];
+      const outcomes     = market.outcomes ?? [];
       const impliedProbs = outcomes.map(o => americanToImplied(o.price));
-      const total = impliedProbs.reduce((s, p) => s + p, 0);
+      const total        = impliedProbs.reduce((s, p) => s + p, 0);
       if (total <= 0) continue;
 
       const idx = outcomes.findIndex(
@@ -289,7 +328,7 @@ function collectAllBookProbs(event, targetOutcomeName) {
 }
 
 function inferSport(tags = [], sportKey = '') {
-  const tagStr = (tags.join(' ') + ' ' + sportKey).toLowerCase();
+  const tagStr = (tags.join(' ') + ' ' + (sportKey ?? '')).toLowerCase();
 
   if (tagStr.includes('nfl') || tagStr.includes('americanfootball_nfl')) return 'NFL';
   if (tagStr.includes('ncaaf') || tagStr.includes('americanfootball_ncaaf')) return 'NCAAF';
@@ -299,7 +338,7 @@ function inferSport(tags = [], sportKey = '') {
   if (tagStr.includes('nhl') || tagStr.includes('icehockey')) return 'NHL';
   if (tagStr.includes('mls') || tagStr.includes('soccer_usa')) return 'Soccer';
   if (tagStr.includes('epl') || tagStr.includes('soccer_epl')) return 'Soccer';
-  if (tagStr.includes('ucl') || tagStr.includes('champions_league')) return 'Soccer';
+  if (tagStr.includes('ucl') || tagStr.includes('champions')) return 'Soccer';
   if (tagStr.includes('soccer')) return 'Soccer';
   if (tagStr.includes('ufc') || tagStr.includes('mma')) return 'UFC/MMA';
   if (tagStr.includes('boxing')) return 'Boxing';

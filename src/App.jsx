@@ -51,6 +51,7 @@ export default function App() {
           opportunities={opportunities}
           status={status}
           error={error}
+          scanStats={scanStats}
         />
       )}
 

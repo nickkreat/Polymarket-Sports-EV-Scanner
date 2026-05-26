@@ -18,7 +18,8 @@ export default function Header({ onSettingsOpen, onScan, scanning, lastScanned, 
         {/* Stats bar */}
         {stats && (
           <div className="hidden md:flex items-center gap-4 ml-4 px-4 border-l border-[#27272a]">
-            <Stat label="Markets scanned" value={stats.polyMarketsScanned} />
+            <Stat label="Poly markets" value={stats.polyMarketsScanned} />
+            <Stat label="Odds events" value={stats.oddsEventsScanned} />
             <Stat label="Matched" value={stats.matchedMarkets} />
             <Stat label="+EV found" value={stats.positiveEv} highlight />
           </div>

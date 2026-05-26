@@ -3,7 +3,7 @@ import MarketCard from './MarketCard';
 import FilterBar from './FilterBar';
 import { NoResults, ScanError, ScanningSpinner } from './EmptyState';
 
-export default function Dashboard({ opportunities, status, error }) {
+export default function Dashboard({ opportunities, status, error, scanStats }) {
   const [filters, setFilters] = useState({
     query: '',
     sport: '',
@@ -74,7 +74,7 @@ export default function Dashboard({ opportunities, status, error }) {
 
       {/* No results */}
       {!scanning && status === 'done' && filtered.length === 0 && (
-        <NoResults filters={filters} />
+        <NoResults filters={filters} scanStats={scanStats} />
       )}
     </main>
   );
