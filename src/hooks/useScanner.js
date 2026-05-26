@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { fetchSportsMarkets } from '../services/polymarket';
-import { fetchAllFuturesOdds, ALL_SPORT_KEYS } from '../services/oddsApi';
+import { fetchAllFuturesOdds, fetchRelevantSportKeys } from '../services/oddsApi';
 import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
 import { extractTeamFromQuestion, teamMatchScore } from '../utils/matching';
@@ -41,10 +41,14 @@ export function useScanner(settings) {
         console.debug('[Scanner] Sample questions:', polyMarkets.slice(0, 5).map(m => m.question));
       }
 
+      setStatus('scanning — discovering available sports…');
+      const sportKeys = await fetchRelevantSportKeys(settings.oddsApiKey);
+      console.debug(`[Scanner] Sport keys to fetch (${sportKeys.length}):`, sportKeys);
+
       setStatus('scanning — fetching sportsbook odds…');
       const oddsEvents = await fetchAllFuturesOdds(
         settings.oddsApiKey,
-        ALL_SPORT_KEYS,
+        sportKeys,
         { regions: settings.preferredRegions }
       );
       console.debug(`[Scanner] Odds API: fetched ${oddsEvents.length} events`);
