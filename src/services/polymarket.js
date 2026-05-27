@@ -1,8 +1,9 @@
 const GAMMA_API = 'https://gamma-api.polymarket.com';
-const FETCH_TIMEOUT_MS = 8000;
+const FETCH_TIMEOUT_MS = 10000;
+const PAGE_SIZE = 100; // Gamma API hard-caps each response at 100
 
-// Focused list — covers all real Polymarket sports tags without fetching
-// dozens of slugs that return zero results.
+// Focused list — covers all real Polymarket sports tags.
+// Each tag is paginated, so we collect futures AND game-level markets.
 const SPORTS_TAG_SLUGS = [
   'nfl', 'nba', 'mlb', 'nhl',
   'ncaaf', 'ncaab',
@@ -14,17 +15,17 @@ const SPORTS_TAG_SLUGS = [
 
 export async function fetchSportsMarkets(options = {}) {
   const {
-    sports   = SPORTS_TAG_SLUGS,
-    limit    = 200,
+    sports    = SPORTS_TAG_SLUGS,
+    limit     = 1000, // per-tag ceiling; pagination fetches as many as exist up to this
     activeOnly = true,
   } = options;
 
-  // Fetch all tags IN PARALLEL — avoids sequential 28×1-2s waterfall
+  // Fetch all tags IN PARALLEL
   const settled = await Promise.allSettled(
     sports.map(tag => fetchTag(tag, limit, activeOnly))
   );
 
-  const seen      = new Set();
+  const seen       = new Set();
   const allMarkets = [];
 
   for (const r of settled) {
@@ -40,34 +41,46 @@ export async function fetchSportsMarkets(options = {}) {
   return allMarkets;
 }
 
+// Fetch all pages for a single tag slug.  The Gamma API returns at most
+// PAGE_SIZE (100) results per request, so we loop until we get a partial
+// page (meaning we've hit the end) or until we reach `limit`.
 async function fetchTag(tag, limit, activeOnly) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const items = [];
 
-  try {
-    const params = new URLSearchParams({
-      tag_slug: tag,
-      active:   activeOnly ? 'true' : 'false',
-      closed:   'false',
-      limit:    String(limit),
-      offset:   '0',
-    });
+  for (let offset = 0; offset < limit; offset += PAGE_SIZE) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-    const res = await fetch(`${GAMMA_API}/markets?${params}`, {
-      headers: { Accept: 'application/json' },
-      signal:  controller.signal,
-    });
+    try {
+      const params = new URLSearchParams({
+        tag_slug: tag,
+        active:   activeOnly ? 'true' : 'false',
+        closed:   'false',
+        limit:    String(PAGE_SIZE),
+        offset:   String(offset),
+      });
 
-    if (!res.ok) return [];
+      const res = await fetch(`${GAMMA_API}/markets?${params}`, {
+        headers: { Accept: 'application/json' },
+        signal:  controller.signal,
+      });
 
-    const data  = await res.json();
-    const items = Array.isArray(data) ? data : data.markets ?? data.data ?? [];
-    return items.map(normalizeMarket);
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timer);
+      if (!res.ok) break;
+
+      const data = await res.json();
+      const page = Array.isArray(data) ? data : data.markets ?? data.data ?? [];
+      items.push(...page.map(normalizeMarket));
+
+      // Partial page → no more results for this tag
+      if (page.length < PAGE_SIZE) break;
+    } catch {
+      break;
+    } finally {
+      clearTimeout(timer);
+    }
   }
+
+  return items;
 }
 
 function normalizeMarket(m) {

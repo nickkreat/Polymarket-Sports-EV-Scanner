@@ -35,7 +35,7 @@ export function useScanner(settings) {
 
     try {
       setStatus('scanning — fetching Polymarket sports markets…');
-      const polyMarkets = await fetchSportsMarkets({ limit: 200 });
+      const polyMarkets = await fetchSportsMarkets();
       console.debug(`[Scanner] Polymarket: fetched ${polyMarkets.length} markets`);
       if (polyMarkets.length > 0) {
         console.debug('[Scanner] Sample questions:', polyMarkets.slice(0, 5).map(m => m.question));
