@@ -514,20 +514,27 @@ export function isSportsMarket(question) {
 // Returns the canonical name, or null if no pattern matched.
 export function extractTeamFromQuestion(question) {
   const patterns = [
-    // "Will the Heat beat the Celtics?" / "Will Miami defeat Boston?"
-    /will (?:the )?(.+?) (?:beat|defeat|overcome|outperform|top)/i,
-    // "Will the Kansas City Chiefs win the Super Bowl?" / "...win tonight?"
-    /will (?:the )?(.+?) (?:win|make|reach|advance|be named|finish|clinch|capture|claim)/i,
-    // "Kansas City Chiefs to win the Super Bowl" / "Heat to win Game 1"
-    /(?:the )?(.+?) to (?:win|beat|defeat|make|reach|advance|qualify|clinch)/i,
-    // "Heat vs Celtics" — extract the first team (away or favourite listed first)
-    /^(?:the )?(.+?) vs\.? (?:the )?/i,
-    // "Will the Chiefs win the championship/title"
+    // "Will the Heat beat/defeat/top/overcome the Celtics?"
+    /will (?:the )?(.+?) (?:beat|defeat|overcome|outperform|top|outplay|outlast)/i,
+    // "Will the Chiefs win/make/advance/clinch…?"
+    /will (?:the )?(.+?) (?:win|make|reach|advance|be named|finish|clinch|capture|claim|repeat|retain|cover|go undefeated)/i,
+    // "Will the Bears be eliminated/knocked out?"
+    /will (?:the )?(.+?) (?:be eliminated|get eliminated|be knocked out|be upset|lose in)/i,
+    // "Chiefs to win/beat/advance"
+    /(?:^|[^a-z])(?:the )?(.+?) to (?:win|beat|defeat|make|reach|advance|qualify|clinch|retain)/i,
+    // "Heat vs Celtics" / "Will the Heat vs Celtics" / "NBA: Heat vs Celtics"
+    // — extract the team appearing immediately before "vs"
+    /(?:^|[:\-–]\s*)(?:the )?([A-Za-z][A-Za-z ]{1,30}?) vs\.?(?:\s|$)/i,
+    // "Will the Chiefs win the championship/title" (backup)
     /(?:^|will )(?:the )?(.+?) (?:win|championship|title|cup|trophy)/i,
-    // "Kansas City Chiefs Super Bowl winner?"
-    /^(?:the )?(.+?) (?:super bowl|championship|stanley cup|world series|nba finals|stanley|pennant|trophy)/i,
-    // "Who wins the Super Bowl — Chiefs?"  (partial, team in context)
-    /(?:championship|cup|title|trophy|super bowl|world series|nba finals|wimbledon|masters|open).+?(?:the )?([A-Z][a-z]+(?: [A-Z][a-z]+)*)/,
+    // "Kansas City Chiefs Super Bowl winner?" / "Thunder NBA Finals odds?"
+    /^(?:the )?(.+?) (?:super bowl|championship|stanley cup|world series|nba finals|pennant|trophy|odds|chance)/i,
+    // "Who wins the Super Bowl — Chiefs?" — team after dash or em-dash
+    /[—\-–]\s*(?:the )?([A-Z][a-z]+(?: [A-Z][a-z]+)+)/,
+    // "Super Bowl winner: Kansas City Chiefs?" — team after colon
+    /(?:championship|cup|title|trophy|super bowl|world series|nba finals|wimbledon|masters|open|winner|champion)[^:]*:\s*(?:the )?(.+?)(?:\?|$)/i,
+    // "Will [Player] win [Tournament]" already covered, but add "earn/take/grab"
+    /will (?:the )?(.+?) (?:earn|take|grab|secure|sweep|go)/i,
   ];
 
   for (const re of patterns) {

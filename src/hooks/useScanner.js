@@ -64,8 +64,9 @@ export function useScanner(settings) {
       const oddsEvents = [...futuresEvents, ...h2hEvents];
       console.debug(`[Scanner] Odds API total: ${oddsEvents.length} events (${futuresEvents.length} futures + ${h2hEvents.length} games)`);
       if (oddsEvents.length > 0) {
-        console.debug('[Scanner] Sample events:', oddsEvents.slice(0, 3).map(e => ({
+        console.debug('[Scanner] Sample events:', oddsEvents.slice(0, 5).map(e => ({
           sport: e.sport_key,
+          title: e.home_team,   // competition title for outrights (e.g. "Stanley Cup Champion")
           books: e.bookmakers?.length,
           marketTypes: [...new Set(e.bookmakers?.flatMap(b => b.markets?.map(m => m.key) ?? []))],
           sampleOutcomes: e.bookmakers?.[0]?.markets?.[0]?.outcomes?.slice(0, 3).map(o => o.name),
@@ -386,17 +387,40 @@ function sportKeyFromTags(tags = []) {
   return null; // unknown sport → search all events
 }
 
+// Extract the specific competition type from a question so we can match it against
+// event.home_team (which The Odds API sets to the competition title for outrights,
+// e.g. "Stanley Cup Champion", "Eastern Conference", "Super Bowl Winner").
+// Prevents "Will Montreal win the Stanley Cup?" matching an Eastern Conference event
+// where Montreal has a higher devigged probability → fake +EV.
+function extractEventTopic(question) {
+  const q = question.toLowerCase();
+  if (q.includes('stanley cup'))                        return 'stanley cup';
+  if (q.includes('super bowl'))                         return 'super bowl';
+  if (q.includes('world series'))                       return 'world series';
+  if (q.includes('nba finals') || q.includes('nba championship')) return 'nba';
+  if (q.includes('world cup'))                          return 'world cup';
+  if (q.includes('champions league'))                   return 'champions league';
+  if (q.includes('eastern conference final'))            return 'eastern conference final';
+  if (q.includes('western conference final'))            return 'western conference final';
+  if (q.includes('eastern conference'))                  return 'eastern';
+  if (q.includes('western conference'))                  return 'western';
+  if (q.includes('nfc championship'))                   return 'nfc';
+  if (q.includes('afc championship'))                   return 'afc';
+  if (q.includes('masters') && !q.includes('basketball')) return 'masters';
+  if (q.includes('wimbledon'))                          return 'wimbledon';
+  if (q.includes('french open') || q.includes('roland garros')) return 'french open';
+  if (q.includes('australian open'))                    return 'australian open';
+  if (q.includes('us open'))                            return 'us open';
+  return null;
+}
+
 // Find the best-matching sportsbook outcome for a given name.
-// question drives both championship detection and sport-context derivation.
+// question drives championship detection, sport-context, and competition-topic filtering.
 function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
   const isChampionship = isChampionshipQuestion(question);
   const allowedKeys = isChampionship ? ['outrights'] : ['outrights', 'h2h'];
-
-  // Use tag-based hint first; fall back to question-text-based hint.
-  // The question fallback is critical for markets tagged only as 'sports' —
-  // "Will Jordan win the 2026 FIFA World Cup?" → 'soccer' from question text
-  // prevents "Jordan" matching "Jordan Spieth" in golf events.
   const sportHint = sportKeyFromTags(marketTags) || sportKeyFromQuestion(question);
+  const topicHint = isChampionship ? extractEventTopic(question) : null;
 
   let candidates = oddsEvents;
   if (sportHint) {
@@ -406,11 +430,20 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
     if (scoped.length > 0) {
       candidates = scoped;
     } else if (isChampionship) {
-      // Championship + known sport but zero sportsbook events for that sport:
-      // do NOT fall back to all events — cross-sport false positives are worse
-      // than missing a result.
       return null;
     }
+  }
+
+  // For championship questions, narrow to sportsbook events whose home_team field
+  // (= competition title in The Odds API's outright format) matches the competition.
+  // Example: "Will Montreal win the Stanley Cup?" → topicHint = "stanley cup" →
+  // only events where home_team contains "stanley cup", not "eastern conference".
+  if (topicHint) {
+    const topicScoped = candidates.filter(e => {
+      const title = ((e.home_team ?? '') + ' ' + (e.away_team ?? '')).toLowerCase();
+      return title.includes(topicHint);
+    });
+    if (topicScoped.length > 0) candidates = topicScoped;
   }
 
   return searchEvents(name, candidates, allowedKeys);
