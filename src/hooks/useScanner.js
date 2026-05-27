@@ -142,6 +142,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
   const bankroll    = settings.bankroll    ?? 1000;
   const fraction    = settings.kellyFraction ?? 0.5;
   const maxKellyPct = (settings.maxKellyPct ?? 25) / 100;
+  const deviGMethod = settings.deviGMethod ?? 'multiplicative';
 
   // Per-step diagnostic counters
   const stats = {
@@ -186,21 +187,24 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       const teamFromQuestion = extractTeamFromQuestion(market.question);
       if (!teamFromQuestion) {
         stats.binaryNoQuestion++;
-        // Log first 10 failures to identify missing patterns
         if (stats.binaryNoQuestion <= 10) {
           console.debug(`[Scanner] No team extracted: "${market.question}"`);
         }
         continue;
       }
 
-      const match = findBestOddsMatch(teamFromQuestion, oddsEvents, market.tags, market.question);
+      const match = findBestOddsMatch(teamFromQuestion, oddsEvents, market.tags, market.question, deviGMethod);
       if (!match) {
         stats.binaryNoOddsMatch++;
         console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamFromQuestion}"`);
         continue;
       }
 
-      const { trueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
+      const { trueProb: rawTrueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
+      // Flip probability for negatively-framed questions ("miss playoffs", "fail to qualify", etc.)
+      // so YES price is compared against the correct side of the sportsbook market.
+      const isNegative = isNegativeOutcome(market.question);
+      const trueProb   = isNegative ? 1 - rawTrueProb : rawTrueProb;
 
       const yesEv    = evPercent(trueProb, yesPrice);
       const noEv     = evPercent(1 - trueProb, noPrice);
@@ -264,7 +268,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
         if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
 
-        const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question);
+        const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question, deviGMethod);
         if (!match) {
           stats.multiNoOddsMatch++;
           continue;
@@ -427,6 +431,13 @@ function extractEventTopic(question) {
   return null;
 }
 
+// Returns true for questions where YES = the named team DOES NOT do the thing.
+// e.g. "Will the Lakers miss the playoffs?" → YES = Lakers miss → sportsbook prob needs flipping.
+function isNegativeOutcome(question) {
+  const q = question.toLowerCase();
+  return /\b(miss (?:the )?playoffs?|fail to (?:make|qualify|advance|reach)|be relegated|be swept(?:\s+in|\s+by|$)|not (?:make|qualify|reach|advance the) playoffs?)\b/.test(q);
+}
+
 // Returns true for questions about a specific game or match (not season-long futures).
 // These should only ever be compared against sportsbook H2H game lines.
 function isGameQuestion(question) {
@@ -446,7 +457,7 @@ function isGameQuestion(question) {
 //   game question          → h2h only        (never championship futures)
 //   season-long / unclear  → outrights only  (safer: futures vs futures)
 // This stops "Spurs win NBA title" from matching the Spurs' next-game h2h price.
-function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
+function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', deviGMethod = 'multiplicative') {
   const isChampionship = isChampionshipQuestion(question);
   const isGame         = !isChampionship && isGameQuestion(question);
 
@@ -457,8 +468,6 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
   const topicHint = isChampionship ? extractEventTopic(question) : null;
 
   // Pre-filter event pool to only events that actually contain the right market type.
-  // This is the hard wall that prevents cross-type contamination even if later
-  // filtering logic has a gap.
   const typePool = oddsEvents.filter(e =>
     e.bookmakers?.some(b => b.markets?.some(m => allowedKeys.includes(m.key)))
   );
@@ -466,19 +475,26 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
 
   let candidates = typePool;
   if (sportHint) {
-    const scoped = typePool.filter(e =>
-      e.sport_key?.toLowerCase().includes(sportHint)
-    );
+    const scoped = typePool.filter(e => e.sport_key?.toLowerCase().includes(sportHint));
     if (scoped.length > 0) {
       candidates = scoped;
+    } else if (sportHint.includes('_')) {
+      // Broaden: 'americanfootball_nfl' → try 'americanfootball' (catches ncaaf, etc.)
+      const broadHint = sportHint.split('_')[0];
+      const broadScoped = typePool.filter(e => e.sport_key?.toLowerCase().includes(broadHint));
+      if (broadScoped.length > 0) {
+        candidates = broadScoped;
+      } else if (!isGame) {
+        return null; // Known sport, zero events → skip (avoids cross-sport false match)
+      }
     } else if (!isGame) {
-      // Championship/futures + known sport + zero matching events → don't cross-sport
       return null;
     }
+    // Game questions with no sport match fall through to full typePool — better than no match.
   }
 
   // For championship questions, narrow further to events whose home_team
-  // (= competition title in The Odds API's outright format) matches.
+  // (= competition title in The Odds API's outright format) matches the topic.
   // e.g. "Stanley Cup" → only "Stanley Cup Champion" events, not "Eastern Conference".
   if (topicHint) {
     const topicScoped = candidates.filter(e => {
@@ -488,10 +504,10 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
     if (topicScoped.length > 0) candidates = topicScoped;
   }
 
-  return searchEvents(name, candidates, allowedKeys);
+  return searchEvents(name, candidates, allowedKeys, deviGMethod);
 }
 
-function searchEvents(name, events, allowedKeys = ['outrights', 'h2h']) {
+function searchEvents(name, events, allowedKeys = ['outrights', 'h2h'], deviGMethod = 'multiplicative') {
   let bestScore = MIN_MATCH_SCORE - 0.001;
   let bestData  = null;
 
@@ -506,7 +522,7 @@ function searchEvents(name, events, allowedKeys = ['outrights', 'h2h']) {
           const score = teamMatchScore(name, outcome.name);
           if (score < MIN_MATCH_SCORE || score <= bestScore) continue;
 
-          const allBookProbs = collectAllBookProbs(event, outcome.name, allowedKeys);
+          const allBookProbs = collectAllBookProbs(event, outcome.name, allowedKeys, deviGMethod);
           if (allBookProbs.length === 0) continue;
 
           const trueProb = allBookProbs.reduce((s, p) => s + p, 0) / allBookProbs.length;
@@ -540,7 +556,10 @@ function searchEvents(name, events, allowedKeys = ['outrights', 'h2h']) {
 }
 
 // Collect devigged probabilities for a named outcome across all bookmakers in an event.
-function collectAllBookProbs(event, targetOutcomeName, allowedKeys = ['outrights', 'h2h']) {
+// Supports two devig methods:
+//   multiplicative (default) — proportional normalization: p_i / sum(p)
+//   additive                 — subtracts equal vig share from each outcome before normalizing
+function collectAllBookProbs(event, targetOutcomeName, allowedKeys = ['outrights', 'h2h'], deviGMethod = 'multiplicative') {
   const devigged = [];
 
   for (const book of event.bookmakers ?? []) {
@@ -550,14 +569,25 @@ function collectAllBookProbs(event, targetOutcomeName, allowedKeys = ['outrights
       const outcomes     = market.outcomes ?? [];
       const impliedProbs = outcomes.map(o => americanToImplied(o.price));
       const total        = impliedProbs.reduce((s, p) => s + p, 0);
-      if (total <= 0) continue;
+      if (total <= 0 || outcomes.length === 0) continue;
 
       const idx = outcomes.findIndex(
         o => teamMatchScore(targetOutcomeName, o.name) >= MIN_MATCH_SCORE
       );
       if (idx === -1) continue;
 
-      devigged.push(impliedProbs[idx] / total);
+      let noVigProb;
+      if (deviGMethod === 'additive') {
+        const vigPerOutcome = (total - 1) / outcomes.length;
+        const adjusted = impliedProbs.map(p => Math.max(0, p - vigPerOutcome));
+        const adjSum   = adjusted.reduce((s, p) => s + p, 0);
+        noVigProb = adjSum > 0 ? adjusted[idx] / adjSum : impliedProbs[idx] / total;
+      } else {
+        // Multiplicative — proportionally shrink all implied probs so they sum to 1
+        noVigProb = impliedProbs[idx] / total;
+      }
+
+      devigged.push(noVigProb);
     }
   }
 

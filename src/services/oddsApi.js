@@ -1,5 +1,19 @@
 const BASE = 'https://api.the-odds-api.com/v4';
 const FETCH_TIMEOUT_MS = 10000;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min — reduces re-scan 429s
+
+// In-memory session cache; cleared on page reload, not persisted.
+const _oddsCache = new Map();
+
+function _getCached(key) {
+  const hit = _oddsCache.get(key);
+  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.data;
+  return null;
+}
+
+function _setCached(key, data) {
+  _oddsCache.set(key, { data, ts: Date.now() });
+}
 
 function withTimeout(promise, ms) {
   const controller = new AbortController();
@@ -35,6 +49,10 @@ export const ALL_SPORT_KEYS = CORE_SPORT_KEYS;
 export async function fetchFuturesOdds(sportKey, apiKey, { regions = 'us,us2', bookmakers } = {}) {
   if (!apiKey) throw new Error('No Odds API key configured');
 
+  const cacheKey = `futures|${sportKey}|${regions}|${bookmakers ?? ''}`;
+  const cached = _getCached(cacheKey);
+  if (cached) return cached;
+
   const params = new URLSearchParams({
     apiKey,
     regions,
@@ -50,8 +68,6 @@ export async function fetchFuturesOdds(sportKey, apiKey, { regions = 'us,us2', b
     .finally(() => clearTimeout(timer));
 
   if (res.status === 422) {
-    // Invalid sport key — return empty quietly; don't throw so the browser
-    // doesn't log a red network error for every caller.
     return [];
   }
 
@@ -60,7 +76,9 @@ export async function fetchFuturesOdds(sportKey, apiKey, { regions = 'us,us2', b
     throw new Error(`Odds API ${res.status} for ${sportKey}: ${body}`);
   }
 
-  return res.json();
+  const data = await res.json();
+  _setCached(cacheKey, data);
+  return data;
 }
 
 /**
@@ -70,6 +88,10 @@ export async function fetchFuturesOdds(sportKey, apiKey, { regions = 'us,us2', b
  */
 export async function fetchRelevantSportKeys(apiKey) {
   if (!apiKey) return CORE_SPORT_KEYS;
+
+  const cacheKey = `sports|${apiKey}`;
+  const cached = _getCached(cacheKey);
+  if (cached) return cached;
 
   try {
     const controller = new AbortController();
@@ -93,7 +115,9 @@ export async function fetchRelevantSportKeys(apiKey) {
       })
       .map(s => s.key);
 
-    return relevant.length ? relevant : CORE_SPORT_KEYS;
+    const result = relevant.length ? relevant : CORE_SPORT_KEYS;
+    _setCached(cacheKey, result);
+    return result;
   } catch {
     return CORE_SPORT_KEYS;
   }
@@ -124,6 +148,10 @@ export async function fetchAllFuturesOdds(apiKey, sportKeys = CORE_SPORT_KEYS, o
 export async function fetchH2HOdds(sportKey, apiKey, { regions = 'us,us2' } = {}) {
   if (!apiKey) throw new Error('No Odds API key configured');
 
+  const cacheKey = `h2h|${sportKey}|${regions}`;
+  const cached = _getCached(cacheKey);
+  if (cached) return cached;
+
   const params = new URLSearchParams({
     apiKey,
     regions,
@@ -142,7 +170,9 @@ export async function fetchH2HOdds(sportKey, apiKey, { regions = 'us,us2' } = {}
     throw new Error(`Odds API ${res.status} for ${sportKey} h2h: ${body}`);
   }
 
-  return res.json();
+  const data = await res.json();
+  _setCached(cacheKey, data);
+  return data;
 }
 
 /**

@@ -498,11 +498,18 @@ const NON_SPORTS_KEYWORDS = [
   'oscar', 'emmy', 'grammy', 'golden globe', 'academy award', 'bafta',
   'celebrity', 'actor', 'actress', 'director', 'film', 'movie', 'album',
   'song', 'music', 'billboard', 'gramophone', 'reality tv', 'bachelor',
+  'rihanna', 'taylor swift', 'beyonce', 'drake', 'kanye west',
+  // Tech / gaming (non-sports)
+  'gta vi', 'gta 6', 'video game', 'playstation', 'xbox release',
   // Finance / crypto
   'bitcoin', 'ethereum', 'crypto', 'stock', 's&p', 'nasdaq', 'dow jones',
   'fed rate', 'interest rate', 'gdp', 'inflation', 'recession',
-  // Other
+  // Science / nature
   'spacex', 'rocket', 'launch', 'climate', 'temperature', 'hurricane',
+  'earthquake', 'vaccine', 'clinical trial',
+  // Sports-adjacent non-bettable (no sportsbook equivalent)
+  'head coach of', 'fired as coach', 'hired as coach',
+  'trade deadline', 'drafted by', 'sign with the',
 ];
 
 export function isSportsMarket(question) {
@@ -518,8 +525,8 @@ export function extractTeamFromQuestion(question) {
     /will (?:the )?(.+?) (?:beat|defeat|overcome|outperform|top|outplay|outlast)/i,
     // "Will the Chiefs win/make/advance/clinch…?"
     /will (?:the )?(.+?) (?:win|make|reach|advance|be named|finish|clinch|capture|claim|repeat|retain|cover|go undefeated)/i,
-    // "Will the Bears be eliminated/knocked out?"
-    /will (?:the )?(.+?) (?:be eliminated|get eliminated|be knocked out|be upset|lose in)/i,
+    // "Will the Bears be eliminated/knocked out/miss the playoffs?"
+    /will (?:the )?(.+?) (?:be eliminated|get eliminated|be knocked out|be upset|lose in|miss (?:the )?playoffs?|fail to (?:make|qualify|advance|reach)|be relegated)/i,
     // "Chiefs to win/beat/advance"
     /(?:^|[^a-z])(?:the )?(.+?) to (?:win|beat|defeat|make|reach|advance|qualify|clinch|retain)/i,
     // "Heat vs Celtics" / "Will the Heat vs Celtics" / "NBA: Heat vs Celtics"
@@ -533,8 +540,10 @@ export function extractTeamFromQuestion(question) {
     /[—\-–]\s*(?:the )?([A-Z][a-z]+(?: [A-Z][a-z]+)+)/,
     // "Super Bowl winner: Kansas City Chiefs?" — team after colon
     /(?:championship|cup|title|trophy|super bowl|world series|nba finals|wimbledon|masters|open|winner|champion)[^:]*:\s*(?:the )?(.+?)(?:\?|$)/i,
-    // "Will [Player] win [Tournament]" already covered, but add "earn/take/grab"
-    /will (?:the )?(.+?) (?:earn|take|grab|secure|sweep|go)/i,
+    // "Will [Player] win [Tournament]" already covered, but add "earn/take/grab/lead"
+    /will (?:the )?(.+?) (?:earn|take|grab|secure|sweep|go|lead|host)/i,
+    // "[Team] to miss/fail/not make playoffs" — negative phrasing team extraction
+    /(?:^|[^a-z])(?:the )?(.+?) (?:to miss|to fail|to not make)/i,
   ];
 
   for (const re of patterns) {
