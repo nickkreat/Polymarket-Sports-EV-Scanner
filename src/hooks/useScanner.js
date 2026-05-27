@@ -1,9 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
 import { fetchSportsMarkets } from '../services/polymarket';
-import { fetchAllFuturesOdds, fetchAllH2HOdds, fetchRelevantSportKeys, CORE_SPORT_KEYS } from '../services/oddsApi';
+import { fetchAllFuturesOdds, fetchAllH2HOdds, fetchRelevantSportKeys } from '../services/oddsApi';
 import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
-import { extractTeamFromQuestion, teamMatchScore, isSportsMarket } from '../utils/matching';
+import { extractTeamFromQuestion, canonicalTeamName, teamMatchScore, isSportsMarket } from '../utils/matching';
 
 const MIN_MATCH_SCORE = 0.66;
 
@@ -65,7 +65,7 @@ export function useScanner(settings) {
       setStatus('scanning — fetching sportsbook game odds…');
       const h2hEvents = await fetchAllH2HOdds(
         settings.oddsApiKey,
-        CORE_SPORT_KEYS,
+        sportKeys,   // use the same dynamically-discovered keys as futures (includes tennis, boxing, MMA)
         { regions: settings.preferredRegions }
       );
       console.debug(`[Scanner] Odds API H2H: ${h2hEvents.length} game events`);
@@ -184,27 +184,66 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 
       if (!yesPrice || yesPrice <= 0 || yesPrice >= 1) continue;
 
-      const teamFromQuestion = extractTeamFromQuestion(market.question);
-      if (!teamFromQuestion) {
-        stats.binaryNoQuestion++;
-        if (stats.binaryNoQuestion <= 10) {
-          console.debug(`[Scanner] No team extracted: "${market.question}"`);
+      const isChamp = isChampionshipQuestion(market.question);
+      const isGame  = !isChamp && isGameQuestion(market.question);
+
+      let trueProb, bestBook, bestOdds, noVigProb, totalBooks, event;
+
+      // ── Path A: game question → dual-team H2H matching ────────────────────
+      if (isGame) {
+        const parsed = parseGameQuestion(market.question);
+        if (parsed) {
+          const h2hPool = oddsEvents.filter(e =>
+            e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
+          );
+          const h2hEvt = findH2HEvent(parsed.teamA, parsed.teamB, h2hPool);
+          if (h2hEvt) {
+            const p = getH2HProbForTeam(h2hEvt, parsed.teamA, deviGMethod);
+            if (p) {
+              const flip = isNegativeOutcome(market.question);
+              trueProb   = flip ? 1 - p.trueProb : p.trueProb;
+              noVigProb  = p.trueProb;
+              bestBook   = p.bestBook;
+              bestOdds   = p.bestOdds;
+              totalBooks = p.totalBooks;
+              event      = h2hEvt;
+              console.debug(
+                `[Match-H2H] "${market.question}" → ${parsed.teamA} vs ${parsed.teamB}` +
+                ` trueProb=${(trueProb * 100).toFixed(1)}% flip=${flip} books=${totalBooks}`
+              );
+            }
+          }
         }
-        continue;
       }
 
-      const match = findBestOddsMatch(teamFromQuestion, oddsEvents, market.tags, market.question, deviGMethod);
-      if (!match) {
+      // ── Path B: single-team fallback (futures, championships, unmatched games) ──
+      if (trueProb === undefined) {
+        const teamName = extractTeamFromQuestion(market.question);
+        if (!teamName) {
+          stats.binaryNoQuestion++;
+          if (stats.binaryNoQuestion <= 10)
+            console.debug(`[Scanner] No team extracted: "${market.question}"`);
+          continue;
+        }
+        const match = findBestOddsMatch(teamName, oddsEvents, market.tags, market.question, deviGMethod);
+        if (!match) {
+          stats.binaryNoOddsMatch++;
+          console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamName}"`);
+          continue;
+        }
+        const flip = isNegativeOutcome(market.question);
+        trueProb   = flip ? 1 - match.trueProb : match.trueProb;
+        noVigProb  = match.noVigProb;
+        bestBook   = match.bestBook;
+        bestOdds   = match.bestOdds;
+        totalBooks = match.totalBooks;
+        event      = match.event;
+      }
+
+      if (trueProb === undefined) {
         stats.binaryNoOddsMatch++;
-        console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamFromQuestion}"`);
         continue;
       }
-
-      const { trueProb: rawTrueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
-      // Flip probability for negatively-framed questions ("miss playoffs", "fail to qualify", etc.)
-      // so YES price is compared against the correct side of the sportsbook market.
-      const isNegative = isNegativeOutcome(market.question);
-      const trueProb   = isNegative ? 1 - rawTrueProb : rawTrueProb;
 
       const yesEv    = evPercent(trueProb, yesPrice);
       const noEv     = evPercent(1 - trueProb, noPrice);
@@ -322,6 +361,123 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
   return { results, stats };
 }
 
+// ── Game market helpers ───────────────────────────────────────────────────────
+
+// Parse a game question to extract BOTH competing teams so we can find the
+// exact H2H event rather than fuzzy-searching on just one team name.
+// Returns { teamA, teamB } where teamA = YES subject, or null if unrecognised.
+function parseGameQuestion(question) {
+  const tryPair = (a, b) => {
+    if (!a || !b) return null;
+    const ca = canonicalTeamName(a.trim().replace(/[?!.,]$/, ''));
+    const cb = canonicalTeamName(b.trim().replace(/[?!.,]$/, ''));
+    if (!ca || !cb || ca.length < 2 || cb.length < 2 || ca === cb) return null;
+    return { teamA: ca, teamB: cb };
+  };
+
+  let m;
+  // "Will [A] beat/defeat/top/outlast [B]…"
+  m = question.match(/will (?:the )?(.+?) (?:beat|defeat|top|outplay|outlast|overcome|outperform) (?:the )?(.+?)(?:[?,]|\?|$)/i);
+  if (m) return tryPair(m[1], m[2]);
+
+  // "Can [A] beat/win against [B]…"
+  m = question.match(/can (?:the )?(.+?) (?:beat|defeat|win against|win over) (?:the )?(.+?)(?:[?,]|\?|$)/i);
+  if (m) return tryPair(m[1], m[2]);
+
+  // "[A] vs [B]" / "Will the [A] vs [B]"
+  m = question.match(/(?:will (?:the )?)?(.+?)\s+vs\.?\s+(?:the )?(.+?)(?:\s*[-—,?]|\?|\s+game\s|\s*$)/i);
+  if (m) return tryPair(m[1], m[2]);
+
+  // "Who wins: [A] or [B]" / "Who wins between [A] and [B]"
+  m = question.match(/who wins[^:]*[:\s]+(?:the )?(.+?)\s+(?:or|and)\s+(?:the )?(.+?)(?:[?,]|\?|$)/i);
+  if (m) return tryPair(m[1], m[2]);
+
+  // "[A] at [B]" / "[A] @ [B]" — visitor at home
+  m = question.match(/^(?:will (?:the )?)?(.+?)\s+(?:at|@)\s+(?:the )?(.+?)(?:[?,]|\?|$)/i);
+  if (m) return tryPair(m[1], m[2]);
+
+  return null;
+}
+
+// Find the H2H event where BOTH teams match (one each side of home/away).
+// This prevents "Thunder vs Suns" matching when the question is "Thunder vs Wolves".
+function findH2HEvent(teamA, teamB, h2hEvents) {
+  let bestEvent = null;
+  let bestScore  = MIN_MATCH_SCORE - 0.001;
+
+  for (const event of h2hEvents) {
+    const homeA  = teamMatchScore(teamA, event.home_team ?? '');
+    const awayA  = teamMatchScore(teamA, event.away_team ?? '');
+    const homeB  = teamMatchScore(teamB, event.home_team ?? '');
+    const awayB  = teamMatchScore(teamB, event.away_team ?? '');
+
+    // A=home & B=away, or A=away & B=home — take the better combination
+    const combo = Math.max(Math.min(homeA, awayB), Math.min(awayA, homeB));
+
+    if (combo >= MIN_MATCH_SCORE && combo > bestScore) {
+      bestScore = combo;
+      bestEvent = event;
+    }
+  }
+
+  return bestEvent;
+}
+
+// Sharp books give more reliable consensus lines; weight them 2× vs recreational books.
+const SHARP_BOOK_KEYS = new Set(['pinnacle', 'betfair_ex_eu', 'circa', 'bookmaker', 'betonlineag', 'lowvig']);
+
+// Compute the devigged moneyline probability for the named team in a specific event.
+function getH2HProbForTeam(event, teamName, deviGMethod = 'multiplicative') {
+  const samples = [];
+
+  for (const book of event.bookmakers ?? []) {
+    const h2hMkt = book.markets?.find(m => m.key === 'h2h');
+    if (!h2hMkt) continue;
+
+    const outcomes     = h2hMkt.outcomes ?? [];
+    if (outcomes.length < 2) continue;
+    const impliedProbs = outcomes.map(o => americanToImplied(o.price));
+    const total        = impliedProbs.reduce((s, p) => s + p, 0);
+    if (total <= 0) continue;
+
+    const idx = outcomes.findIndex(o => teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE);
+    if (idx === -1) continue;
+
+    let prob;
+    if (deviGMethod === 'additive') {
+      const vigPerSide = (total - 1) / outcomes.length;
+      const adjusted   = impliedProbs.map(p => Math.max(0, p - vigPerSide));
+      const adjSum     = adjusted.reduce((s, p) => s + p, 0);
+      prob = adjSum > 0 ? adjusted[idx] / adjSum : impliedProbs[idx] / total;
+    } else {
+      prob = impliedProbs[idx] / total;
+    }
+
+    samples.push({ prob, bookKey: book.key ?? '', bookTitle: book.title ?? '' });
+  }
+
+  if (!samples.length) return null;
+
+  // Weighted average — sharp books count 2× to reduce recreational-book dilution
+  let wSum = 0, wTotal = 0;
+  for (const { prob, bookKey } of samples) {
+    const w = SHARP_BOOK_KEYS.has(bookKey) ? 2.0 : 1.0;
+    wSum   += prob * w;
+    wTotal += w;
+  }
+
+  const sharpSample = samples.find(s => SHARP_BOOK_KEYS.has(s.bookKey));
+  const firstH2H    = event.bookmakers?.[0]?.markets?.find(m => m.key === 'h2h');
+  const matchedOdds = firstH2H?.outcomes?.find(o => teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE)?.price ?? 0;
+
+  return {
+    trueProb:   wSum / wTotal,
+    totalBooks: samples.length,
+    bestBook:   sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
+    bestOdds:   matchedOdds,
+  };
+}
+
 // ── Championship vs game-level question detection ─────────────────────────────
 // If the question mentions a season/tournament winner event, restrict matching
 // to sportsbook outrights only.  Game-level questions can also use h2h odds.
@@ -431,11 +587,13 @@ function extractEventTopic(question) {
   return null;
 }
 
-// Returns true for questions where YES = the named team DOES NOT do the thing.
-// e.g. "Will the Lakers miss the playoffs?" → YES = Lakers miss → sportsbook prob needs flipping.
+// Returns true for questions where YES = the named team DOES NOT do the positive thing.
+// Used to flip the sportsbook probability so YES EV is computed against the correct side.
+// e.g. "Will the Lakers miss the playoffs?" → YES = Lakers miss → flip sportsbook make-playoffs prob.
+// e.g. "Will the Wolves lose to OKC?" → YES = Wolves lose → flip Wolves win probability.
 function isNegativeOutcome(question) {
   const q = question.toLowerCase();
-  return /\b(miss (?:the )?playoffs?|fail to (?:make|qualify|advance|reach)|be relegated|be swept(?:\s+in|\s+by|$)|not (?:make|qualify|reach|advance the) playoffs?)\b/.test(q);
+  return /\b(miss (?:the )?playoffs?|fail to (?:make|qualify|advance|reach|beat|defeat|win)|be relegated|be swept(?:\s+in|\s+by|$)|not (?:make|qualify|reach|advance the) playoffs?|lose to|fall to|get beaten|lose (?:against|in game))\b/.test(q);
 }
 
 // Returns true for questions about a specific game or match (not season-long futures).

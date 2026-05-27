@@ -544,6 +544,12 @@ export function extractTeamFromQuestion(question) {
     /will (?:the )?(.+?) (?:earn|take|grab|secure|sweep|go|lead|host)/i,
     // "[Team] to miss/fail/not make playoffs" — negative phrasing team extraction
     /(?:^|[^a-z])(?:the )?(.+?) (?:to miss|to fail|to not make)/i,
+    // "Can [A] beat/defeat/win against [B]?"
+    /can (?:the )?(.+?) (?:beat|defeat|win against|win over|win tonight|win game)/i,
+    // "Who wins: [A] or [B]?" — extract left-side team
+    /who wins[^:]*[:\s]+(?:the )?([A-Za-z][A-Za-z ]{1,30}?)\s+(?:or|and)\s+/i,
+    // "Is [Team] going to win?" / "Are [Team] winning tonight?"
+    /(?:is|are) (?:the )?(.+?) (?:going to win|winning tonight|likely to win)/i,
   ];
 
   for (const re of patterns) {
