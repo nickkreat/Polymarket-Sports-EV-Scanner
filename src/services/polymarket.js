@@ -84,36 +84,21 @@ async function fetchTag(tag, activeOnly) {
   return items;
 }
 
-// Log the first raw market object so the URL fields are visible in DevTools.
-// This runs once per page load and helps verify the URL construction is correct.
-let _logged = false;
-
 function buildUrl(m) {
-  // Log every field of the first market to find the correct URL slug field
-  if (!_logged) {
-    _logged = true;
-    console.log('[Polymarket] First raw market (all fields):', JSON.parse(JSON.stringify(m)));
-  }
-
   // m.url is the most reliable source — use it if it's an absolute URL
   if (m.url && m.url.startsWith('http')) return m.url;
   if (m.url && m.url.startsWith('/'))    return `https://polymarket.com${m.url}`;
 
-  // Fallback: construct from slug fields.
-  // Polymarket event URLs use the EVENT slug, not the market slug.
-  // Market slugs often include an outcome suffix (-yes, -no) that 404s.
-  // Try known field names for the event/group slug first.
-  const eventSlug = (
-    m.groupSlug       ??   // common alias
-    m.eventSlug       ??   // alternative alias
-    m.marketSlug      ??   // another alternative
-    m.slug            ??   // fallback: market slug (strip outcome suffix below)
-    String(m.id ?? '')
-  );
+  // The Gamma API embeds the canonical event slug in m.events[0].slug.
+  // This differs from m.slug (market/outcome slug) for group markets, e.g.:
+  //   m.slug   = "will-okc-win-the-2026-nba-finals"  ← 404s
+  //   events[0].slug = "2026-nba-champion"            ← resolves correctly
+  const eventSlug = m.events?.[0]?.slug ?? null;
+  if (eventSlug) return `https://polymarket.com/event/${eventSlug}`;
 
-  // Strip outcome suffixes like "-yes", "-no", "-0", "-1" from market slugs
-  const cleanSlug = eventSlug.replace(/[_-](yes|no|\d+)$/i, '');
-
+  // Fallback for markets with no events array
+  const marketSlug = m.groupSlug ?? m.slug ?? String(m.id ?? '');
+  const cleanSlug  = marketSlug.replace(/[_-](yes|no|\d+)$/i, '');
   return `https://polymarket.com/event/${cleanSlug}`;
 }
 
@@ -148,8 +133,9 @@ function normalizeMarket(m) {
     active:    m.active  ?? true,
     closed:    m.closed  ?? false,
     tags:      tags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
-    url:       buildUrl(m),
-    slug:      m.groupSlug ?? m.slug ?? '',
+    url:        buildUrl(m),
+    slug:       m.events?.[0]?.slug ?? m.groupSlug ?? m.slug ?? '',
+    eventTitle: m.events?.[0]?.title ?? null,
   };
 }
 
