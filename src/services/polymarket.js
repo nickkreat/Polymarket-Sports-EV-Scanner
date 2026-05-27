@@ -1,36 +1,31 @@
 const GAMMA_API = 'https://gamma-api.polymarket.com';
 const FETCH_TIMEOUT_MS = 10000;
-const PAGE_SIZE = 100; // Gamma API hard-caps each response at 100
+const PAGE_SIZE = 100;
 
-// All known Polymarket sports tag slugs.
-// Each tag is paginated so we collect futures AND game-level markets.
+// Only tag slugs confirmed to exist in Polymarket's Gamma API.
+// Fake/guessed slugs (nba-playoffs, premier-league, etc.) cause HTTP 500
+// errors on every paginated request and flood the console.
 const SPORTS_TAG_SLUGS = [
-  // Major US leagues
   'nfl', 'nba', 'mlb', 'nhl',
-  // College
   'ncaaf', 'ncaab',
-  // Soccer
-  'soccer', 'mls', 'premier-league', 'champions-league', 'world-cup',
-  // Combat sports
+  'soccer', 'mls',
   'ufc', 'boxing',
-  // Individual sports
   'golf', 'tennis', 'racing',
-  // Playoffs / postseason (separate tags Polymarket uses during playoffs)
-  'nba-playoffs', 'nhl-playoffs', 'mlb-playoffs', 'nfl-playoffs',
-  // Broad catch-all
   'sports',
 ];
 
+// Cap per-tag pagination at 300.  Most sport tags have far fewer than 300
+// active markets; going to 1000 just generates 500 errors at high offsets.
+const MAX_PER_TAG = 300;
+
 export async function fetchSportsMarkets(options = {}) {
   const {
-    sports    = SPORTS_TAG_SLUGS,
-    limit     = 1000, // per-tag ceiling; pagination fetches as many as exist up to this
+    sports     = SPORTS_TAG_SLUGS,
     activeOnly = true,
   } = options;
 
-  // Fetch all tags IN PARALLEL
   const settled = await Promise.allSettled(
-    sports.map(tag => fetchTag(tag, limit, activeOnly))
+    sports.map(tag => fetchTag(tag, activeOnly))
   );
 
   const seen       = new Set();
@@ -49,13 +44,10 @@ export async function fetchSportsMarkets(options = {}) {
   return allMarkets;
 }
 
-// Fetch all pages for a single tag slug.  The Gamma API returns at most
-// PAGE_SIZE (100) results per request, so we loop until we get a partial
-// page (meaning we've hit the end) or until we reach `limit`.
-async function fetchTag(tag, limit, activeOnly) {
+async function fetchTag(tag, activeOnly) {
   const items = [];
 
-  for (let offset = 0; offset < limit; offset += PAGE_SIZE) {
+  for (let offset = 0; offset < MAX_PER_TAG; offset += PAGE_SIZE) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -77,9 +69,10 @@ async function fetchTag(tag, limit, activeOnly) {
 
       const data = await res.json();
       const page = Array.isArray(data) ? data : data.markets ?? data.data ?? [];
+      if (page.length === 0) break;
+
       items.push(...page.map(normalizeMarket));
 
-      // Partial page → no more results for this tag
       if (page.length < PAGE_SIZE) break;
     } catch {
       break;
@@ -91,20 +84,40 @@ async function fetchTag(tag, limit, activeOnly) {
   return items;
 }
 
-let _debuggedFirst = false;
+// Log the first raw market object so the URL fields are visible in DevTools.
+// This runs once per page load and helps verify the URL construction is correct.
+let _logged = false;
 
-function normalizeMarket(m) {
-  // Log the first raw market so we can verify which fields the API actually returns
-  if (!_debuggedFirst) {
-    _debuggedFirst = true;
-    console.debug('[Polymarket] Raw market fields (first):', {
-      id: m.id, conditionId: m.conditionId,
-      slug: m.slug, groupSlug: m.groupSlug,
-      url: m.url, question: m.question?.slice(0, 60),
-      active: m.active, closed: m.closed,
-    });
+function buildUrl(m) {
+  // Log every field of the first market to find the correct URL slug field
+  if (!_logged) {
+    _logged = true;
+    console.log('[Polymarket] First raw market (all fields):', JSON.parse(JSON.stringify(m)));
   }
 
+  // m.url is the most reliable source — use it if it's an absolute URL
+  if (m.url && m.url.startsWith('http')) return m.url;
+  if (m.url && m.url.startsWith('/'))    return `https://polymarket.com${m.url}`;
+
+  // Fallback: construct from slug fields.
+  // Polymarket event URLs use the EVENT slug, not the market slug.
+  // Market slugs often include an outcome suffix (-yes, -no) that 404s.
+  // Try known field names for the event/group slug first.
+  const eventSlug = (
+    m.groupSlug       ??   // common alias
+    m.eventSlug       ??   // alternative alias
+    m.marketSlug      ??   // another alternative
+    m.slug            ??   // fallback: market slug (strip outcome suffix below)
+    String(m.id ?? '')
+  );
+
+  // Strip outcome suffixes like "-yes", "-no", "-0", "-1" from market slugs
+  const cleanSlug = eventSlug.replace(/[_-](yes|no|\d+)$/i, '');
+
+  return `https://polymarket.com/event/${cleanSlug}`;
+}
+
+function normalizeMarket(m) {
   let outcomes;
   try {
     outcomes = m.outcomes
@@ -123,17 +136,6 @@ function normalizeMarket(m) {
 
   const tags = Array.isArray(m.tags) ? m.tags : [];
 
-  // URL: Polymarket event pages use groupSlug (the parent event), NOT slug
-  // (which includes the outcome suffix, e.g. "-yes", causing 404s).
-  // Priority: m.url (if already absolute) > groupSlug > slug > id
-  const rawUrl = m.url ?? '';
-  const eventSlug = m.groupSlug ?? m.slug ?? m.id ?? '';
-  const url = rawUrl.startsWith('http')
-    ? rawUrl
-    : rawUrl.startsWith('/')
-      ? `https://polymarket.com${rawUrl}`
-      : `https://polymarket.com/event/${eventSlug}`;
-
   return {
     id:          m.id ?? m.conditionId,
     question:    m.question ?? m.title ?? '',
@@ -146,7 +148,7 @@ function normalizeMarket(m) {
     active:    m.active  ?? true,
     closed:    m.closed  ?? false,
     tags:      tags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
-    url,
+    url:       buildUrl(m),
     slug:      m.groupSlug ?? m.slug ?? '',
   };
 }
