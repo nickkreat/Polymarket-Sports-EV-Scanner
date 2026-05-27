@@ -36,9 +36,18 @@ export function useScanner(settings) {
     try {
       setStatus('scanning — fetching Polymarket sports markets…');
       const polyMarkets = await fetchSportsMarkets();
-      console.debug(`[Scanner] Polymarket: fetched ${polyMarkets.length} markets`);
-      if (polyMarkets.length > 0) {
-        console.debug('[Scanner] Sample questions:', polyMarkets.slice(0, 5).map(m => m.question));
+      console.debug(`[Scanner] Polymarket: ${polyMarkets.length} unique markets fetched`);
+      // Log sample URLs so we can verify they resolve correctly
+      console.debug('[Scanner] Sample market URLs:', polyMarkets.slice(0, 5).map(m => ({
+        q: m.question?.slice(0, 50),
+        url: m.url,
+        slug: m.slug,
+      })));
+      // Breakdown by tag (approximated from question content for sanity check)
+      const nonSports = polyMarkets.filter(m => !isSportsMarket(m.question));
+      if (nonSports.length > 0) {
+        console.warn(`[Scanner] ${nonSports.length} non-sports markets will be skipped:`,
+          nonSports.slice(0, 3).map(m => m.question?.slice(0, 60)));
       }
 
       setStatus('scanning — discovering available sports…');
@@ -177,6 +186,10 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       const teamFromQuestion = extractTeamFromQuestion(market.question);
       if (!teamFromQuestion) {
         stats.binaryNoQuestion++;
+        // Log first 10 failures to identify missing patterns
+        if (stats.binaryNoQuestion <= 10) {
+          console.debug(`[Scanner] No team extracted: "${market.question}"`);
+        }
         continue;
       }
 

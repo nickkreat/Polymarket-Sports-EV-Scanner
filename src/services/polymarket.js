@@ -91,7 +91,20 @@ async function fetchTag(tag, limit, activeOnly) {
   return items;
 }
 
+let _debuggedFirst = false;
+
 function normalizeMarket(m) {
+  // Log the first raw market so we can verify which fields the API actually returns
+  if (!_debuggedFirst) {
+    _debuggedFirst = true;
+    console.debug('[Polymarket] Raw market fields (first):', {
+      id: m.id, conditionId: m.conditionId,
+      slug: m.slug, groupSlug: m.groupSlug,
+      url: m.url, question: m.question?.slice(0, 60),
+      active: m.active, closed: m.closed,
+    });
+  }
+
   let outcomes;
   try {
     outcomes = m.outcomes
@@ -108,13 +121,22 @@ function normalizeMarket(m) {
       : outcomes.map(() => 1 / outcomes.length);
   } catch { prices = outcomes.map(() => 1 / outcomes.length); }
 
-  const tags = Array.isArray(m.tags)
-    ? m.tags
-    : [];
+  const tags = Array.isArray(m.tags) ? m.tags : [];
+
+  // URL: Polymarket event pages use groupSlug (the parent event), NOT slug
+  // (which includes the outcome suffix, e.g. "-yes", causing 404s).
+  // Priority: m.url (if already absolute) > groupSlug > slug > id
+  const rawUrl = m.url ?? '';
+  const eventSlug = m.groupSlug ?? m.slug ?? m.id ?? '';
+  const url = rawUrl.startsWith('http')
+    ? rawUrl
+    : rawUrl.startsWith('/')
+      ? `https://polymarket.com${rawUrl}`
+      : `https://polymarket.com/event/${eventSlug}`;
 
   return {
-    id:        m.id ?? m.conditionId,
-    question:  m.question ?? m.title ?? '',
+    id:          m.id ?? m.conditionId,
+    question:    m.question ?? m.title ?? '',
     description: m.description ?? '',
     outcomes,
     prices,
@@ -124,10 +146,8 @@ function normalizeMarket(m) {
     active:    m.active  ?? true,
     closed:    m.closed  ?? false,
     tags:      tags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
-    url:       m.url
-               ? (m.url.startsWith('http') ? m.url : `https://polymarket.com${m.url}`)
-               : `https://polymarket.com/event/${m.slug ?? m.id}`,
-    slug:      m.slug ?? '',
+    url,
+    slug:      m.groupSlug ?? m.slug ?? '',
   };
 }
 
