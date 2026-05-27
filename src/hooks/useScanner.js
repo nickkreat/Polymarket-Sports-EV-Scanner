@@ -414,30 +414,59 @@ function extractEventTopic(question) {
   return null;
 }
 
+// Returns true for questions about a specific game or match (not season-long futures).
+// These should only ever be compared against sportsbook H2H game lines.
+function isGameQuestion(question) {
+  const q = question.toLowerCase();
+  return (
+    /\b(beat|defeat|vs\.?|against)\b/.test(q) ||
+    /\bgame\s+[1-7]\b/.test(q) ||
+    /\b(tonight|tomorrow|moneyline|spread|cover)\b/.test(q) ||
+    // "Lakers at Celtics" / "Rockets @ Spurs"
+    /\b[a-z]+ (?:at|@) [a-z]+\b/.test(q)
+  );
+}
+
 // Find the best-matching sportsbook outcome for a given name.
-// question drives championship detection, sport-context, and competition-topic filtering.
+// Hard type-separation:
+//   championship question  → outrights only  (never h2h game lines)
+//   game question          → h2h only        (never championship futures)
+//   season-long / unclear  → outrights only  (safer: futures vs futures)
+// This stops "Spurs win NBA title" from matching the Spurs' next-game h2h price.
 function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '') {
   const isChampionship = isChampionshipQuestion(question);
-  const allowedKeys = isChampionship ? ['outrights'] : ['outrights', 'h2h'];
+  const isGame         = !isChampionship && isGameQuestion(question);
+
+  // Strict market-type keys — game questions ONLY see h2h, everything else ONLY sees outrights
+  const allowedKeys = isGame ? ['h2h'] : ['outrights'];
+
   const sportHint = sportKeyFromTags(marketTags) || sportKeyFromQuestion(question);
   const topicHint = isChampionship ? extractEventTopic(question) : null;
 
-  let candidates = oddsEvents;
+  // Pre-filter event pool to only events that actually contain the right market type.
+  // This is the hard wall that prevents cross-type contamination even if later
+  // filtering logic has a gap.
+  const typePool = oddsEvents.filter(e =>
+    e.bookmakers?.some(b => b.markets?.some(m => allowedKeys.includes(m.key)))
+  );
+  if (typePool.length === 0) return null;
+
+  let candidates = typePool;
   if (sportHint) {
-    const scoped = oddsEvents.filter(e =>
+    const scoped = typePool.filter(e =>
       e.sport_key?.toLowerCase().includes(sportHint)
     );
     if (scoped.length > 0) {
       candidates = scoped;
-    } else if (isChampionship) {
+    } else if (!isGame) {
+      // Championship/futures + known sport + zero matching events → don't cross-sport
       return null;
     }
   }
 
-  // For championship questions, narrow to sportsbook events whose home_team field
-  // (= competition title in The Odds API's outright format) matches the competition.
-  // Example: "Will Montreal win the Stanley Cup?" → topicHint = "stanley cup" →
-  // only events where home_team contains "stanley cup", not "eastern conference".
+  // For championship questions, narrow further to events whose home_team
+  // (= competition title in The Odds API's outright format) matches.
+  // e.g. "Stanley Cup" → only "Stanley Cup Champion" events, not "Eastern Conference".
   if (topicHint) {
     const topicScoped = candidates.filter(e => {
       const title = ((e.home_team ?? '') + ' ' + (e.away_team ?? '')).toLowerCase();

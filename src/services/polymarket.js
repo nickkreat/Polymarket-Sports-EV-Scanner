@@ -2,14 +2,22 @@ const GAMMA_API = 'https://gamma-api.polymarket.com';
 const FETCH_TIMEOUT_MS = 10000;
 const PAGE_SIZE = 100; // Gamma API hard-caps each response at 100
 
-// Focused list — covers all real Polymarket sports tags.
-// Each tag is paginated, so we collect futures AND game-level markets.
+// All known Polymarket sports tag slugs.
+// Each tag is paginated so we collect futures AND game-level markets.
 const SPORTS_TAG_SLUGS = [
+  // Major US leagues
   'nfl', 'nba', 'mlb', 'nhl',
+  // College
   'ncaaf', 'ncaab',
-  'soccer', 'mls',
+  // Soccer
+  'soccer', 'mls', 'premier-league', 'champions-league', 'world-cup',
+  // Combat sports
   'ufc', 'boxing',
+  // Individual sports
   'golf', 'tennis', 'racing',
+  // Playoffs / postseason (separate tags Polymarket uses during playoffs)
+  'nba-playoffs', 'nhl-playoffs', 'mlb-playoffs', 'nfl-playoffs',
+  // Broad catch-all
   'sports',
 ];
 
@@ -116,7 +124,9 @@ function normalizeMarket(m) {
     active:    m.active  ?? true,
     closed:    m.closed  ?? false,
     tags:      tags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
-    url:       m.url ?? `https://polymarket.com/event/${m.slug ?? m.id}`,
+    url:       m.url
+               ? (m.url.startsWith('http') ? m.url : `https://polymarket.com${m.url}`)
+               : `https://polymarket.com/event/${m.slug ?? m.id}`,
     slug:      m.slug ?? '',
   };
 }
