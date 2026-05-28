@@ -76,7 +76,10 @@ export async function fetchFuturesOdds(sportKey, apiKey, { regions = 'us,us2', b
     throw new Error(`Odds API ${res.status} for ${sportKey}: ${body}`);
   }
 
-  const data = await res.json();
+  const now  = Date.now();
+  const data = (await res.json()).filter(
+    e => !e.commence_time || new Date(e.commence_time).getTime() >= now
+  );
   _setCached(cacheKey, data);
   return data;
 }
@@ -181,7 +184,10 @@ export async function fetchH2HOdds(sportKey, apiKey, { regions = 'us,us2' } = {}
     throw new Error(`Odds API ${res.status} for ${sportKey} h2h: ${body}`);
   }
 
-  const data = await res.json();
+  const now  = Date.now();
+  const data = (await res.json()).filter(
+    e => !e.commence_time || new Date(e.commence_time).getTime() >= now
+  );
   _setCached(cacheKey, data);
   return data;
 }

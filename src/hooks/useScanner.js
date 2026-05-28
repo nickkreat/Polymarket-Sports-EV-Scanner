@@ -181,6 +181,10 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
     // Normalise prices — Polymarket sometimes returns strings
     const normPrices = prices.map(Number);
 
+    // Skip near-resolved markets (one outcome already at 99.5¢+).
+    // Their edges are illusory — a tiny pricing error gets amplified to huge EV%.
+    if (normPrices.some(p => p < 0.005 || p > 0.995)) continue;
+
     if (isBinaryYesNo(outcomes)) {
       // ── Binary YES/NO market ───────────────────────────────────────────────
       stats.binaryChecked++;
@@ -262,9 +266,10 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       if (bestEv < settings.minEvPct)               { stats.filteredEv++; continue; }
 
       // Flag extreme EV — likely a very stale/illiquid price, not a real edge
-      const suspiciousEv = Math.abs(bestEv) > 500;
+      const suspiciousEv = Math.abs(bestEv) > 200;
       if (suspiciousEv) {
         console.warn(`[Scanner] Extreme EV ${bestEv.toFixed(0)}% — verify manually: "${market.question}"`);
+        if (settings.hideSuspiciousEv) { stats.filteredEv++; continue; }
       }
 
       const kellySizing = bestSide === 'YES'
@@ -351,6 +356,10 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             if (bestEv < settings.minEvPct)               { stats.filteredEv++; continue; }
 
             const suspiciousEv = Math.abs(bestEv) > 200;
+            if (suspiciousEv) {
+              console.warn(`[Scanner] Extreme EV ${bestEv.toFixed(0)}% — verify manually: "${market.question}"`);
+              if (settings.hideSuspiciousEv) { stats.filteredEv++; continue; }
+            }
             const kellySizing  = kellySizingYes({ trueProb: bestTrueProb, marketPrice: bestPrice, bankroll, fraction });
             const cappedPct    = Math.min(kellySizing.adjustedPct, maxKellyPct);
 

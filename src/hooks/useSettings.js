@@ -17,6 +17,7 @@ const DEFAULTS = {
   sportsFilter: [],        // empty = all
   marketsFilter: 'futures',
   maxKellyPct: 25,         // cap Kelly bet at X% of bankroll
+  hideSuspiciousEv: true,  // filter markets with EV > 200% (likely data artifacts)
 };
 
 export function useSettings() {

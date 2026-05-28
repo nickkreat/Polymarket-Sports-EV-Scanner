@@ -177,6 +177,17 @@ export default function Settings({ settings, onUpdate, onClose, onReset }) {
                 label="Show markets where you're being mispriced against"
               />
             </Field>
+
+            <Field
+              label="Hide suspicious EV (>200%)"
+              hint={<Tip text="Filters out results with extreme EV% that are almost always data artifacts — stale lines, bad matches, or near-resolved markets." />}
+            >
+              <Toggle
+                checked={settings.hideSuspiciousEv ?? true}
+                onChange={v => update('hideSuspiciousEv', v)}
+                label="Hide results with EV above 200% (recommended)"
+              />
+            </Field>
           </Section>
 
           {/* Sportsbook Settings */}
