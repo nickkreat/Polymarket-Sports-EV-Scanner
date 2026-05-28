@@ -215,7 +215,8 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 
       const isChamp  = isChampionshipQuestion(market.question);
       const isSpread = !isChamp && isSpreadQuestion(market.question);
-      const isGame   = !isChamp && !isSpread && isGameQuestion(market.question);
+      const isTotals = !isChamp && !isSpread && isTotalsQuestion(market.question);
+      const isGame   = !isChamp && !isSpread && !isTotals && isGameQuestion(market.question);
 
       let trueProb, bestBook, bestOdds, noVigProb, totalBooks, event, bookBreakdown;
 
@@ -234,7 +235,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         // Try dual-team parse for accurate event matching
         const parsed = parseGameQuestion(market.question);
         if (parsed) {
-          spreadEvt  = findH2HEvent(parsed.teamA, parsed.teamB, spreadsPool);
+          spreadEvt  = findH2HEvent(parsed.teamA, parsed.teamB, spreadsPool, market.endDate);
           spreadTeam = parsed.teamA;
         }
 
@@ -242,7 +243,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         if (!spreadEvt) {
           const teamName = extractTeamFromQuestion(market.question);
           if (teamName) {
-            spreadEvt  = findSpreadEventForTeam(teamName, spreadsPool);
+            spreadEvt  = findSpreadEventForTeam(teamName, spreadsPool, market.endDate);
             spreadTeam = teamName;
           }
         }
@@ -280,7 +281,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           const h2hPool = oddsEvents.filter(e =>
             e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
           );
-          const h2hEvt = findH2HEvent(parsed.teamA, parsed.teamB, h2hPool);
+          const h2hEvt = findH2HEvent(parsed.teamA, parsed.teamB, h2hPool, market.endDate);
           if (h2hEvt) {
             const p = getH2HProbForTeam(h2hEvt, parsed.teamA, deviGMethod);
             if (p) {
@@ -457,7 +458,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             m.key === 'spreads' || m.key === 'alternate_spreads'
           ))
         );
-        const spreadEvt = findH2HEvent(teamA, teamB, spreadsPool);
+        const spreadEvt = findH2HEvent(teamA, teamB, spreadsPool, market.endDate);
 
         if (!spreadEvt) {
           stats.multiNoOddsMatch++;
@@ -547,7 +548,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         const h2hPool = oddsEvents.filter(e =>
           e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
         );
-        const h2hEvt = findH2HEvent(teamA, teamB, h2hPool);
+        const h2hEvt = findH2HEvent(teamA, teamB, h2hPool, market.endDate);
 
         if (h2hEvt) {
           const pA = getH2HProbForTeam(h2hEvt, teamA, deviGMethod);
@@ -718,22 +719,39 @@ function parseGameQuestion(question) {
 
 // Find the H2H event where BOTH teams match (one each side of home/away).
 // This prevents "Thunder vs Suns" matching when the question is "Thunder vs Wolves".
-function findH2HEvent(teamA, teamB, h2hEvents) {
-  let bestEvent = null;
-  let bestScore  = MIN_MATCH_SCORE - 0.001;
+// endDate: the Polymarket market's endDate — used to prefer events whose commence_time
+// is within 3 days, so series games (Mon/Tue/Wed) match the correct game date.
+function findH2HEvent(teamA, teamB, h2hEvents, endDate = null) {
+  let bestEvent     = null;
+  let bestTeamScore = MIN_MATCH_SCORE - 0.001;
+  let bestDateDiff  = Infinity;
+
+  const endMs = endDate ? Date.parse(endDate) : NaN;
 
   for (const event of h2hEvents) {
-    const homeA  = teamMatchScore(teamA, event.home_team ?? '');
-    const awayA  = teamMatchScore(teamA, event.away_team ?? '');
-    const homeB  = teamMatchScore(teamB, event.home_team ?? '');
-    const awayB  = teamMatchScore(teamB, event.away_team ?? '');
+    const homeA = teamMatchScore(teamA, event.home_team ?? '');
+    const awayA = teamMatchScore(teamA, event.away_team ?? '');
+    const homeB = teamMatchScore(teamB, event.home_team ?? '');
+    const awayB = teamMatchScore(teamB, event.away_team ?? '');
 
     // A=home & B=away, or A=away & B=home — take the better combination
-    const combo = Math.max(Math.min(homeA, awayB), Math.min(awayA, homeB));
+    const teamScore = Math.max(Math.min(homeA, awayB), Math.min(awayA, homeB));
+    if (teamScore < MIN_MATCH_SCORE) continue;
 
-    if (combo >= MIN_MATCH_SCORE && combo > bestScore) {
-      bestScore = combo;
-      bestEvent = event;
+    // Date-proximity: skip events more than 3 days from the Polymarket endDate.
+    // Among events meeting the team threshold, prefer the one closest to endDate.
+    let dateDiff = 0;
+    if (!isNaN(endMs) && event.commence_time) {
+      dateDiff = Math.abs(Date.parse(event.commence_time) - endMs) / 86400000;
+      if (dateDiff > 3) continue;
+    }
+
+    const betterTeam        = teamScore > bestTeamScore;
+    const sameTeamCloserDate = teamScore === bestTeamScore && dateDiff < bestDateDiff;
+    if (betterTeam || sameTeamCloserDate) {
+      bestTeamScore = teamScore;
+      bestDateDiff  = dateDiff;
+      bestEvent     = event;
     }
   }
 
@@ -953,6 +971,10 @@ function isUnsupportedMarketType(question) {
   if (/\btiebreak\b/.test(q) || /\bsuper[- ]?tiebreak\b/.test(q)) return true;
   // Individual game winner within a series (not "win the series" or "win the game")
   if (/\bgame\s+[1-7]\s+winner\b/.test(q)) return true;
+  // First-inning props (NRFI/YRFI) — no standard sportsbook equivalent
+  if (/\bnrfi\b/i.test(q)) return true;
+  if (/\byrfi\b/i.test(q)) return true;
+  if (/\b(?:first|1st)\s+inning\b/i.test(q)) return true;
   return false;
 }
 
@@ -981,18 +1003,33 @@ function extractSpreadFromQuestion(question) {
 
 // Find the best-matching spread event for a single team name.
 // Used when the question names only one side (e.g. "Will the Pirates cover -3.5?").
-function findSpreadEventForTeam(teamName, spreadsEvents) {
-  let bestEvent = null;
-  let bestScore  = MIN_MATCH_SCORE - 0.001;
+// endDate: the Polymarket market's endDate — used for date-proximity tie-breaking.
+function findSpreadEventForTeam(teamName, spreadsEvents, endDate = null) {
+  let bestEvent     = null;
+  let bestTeamScore = MIN_MATCH_SCORE - 0.001;
+  let bestDateDiff  = Infinity;
+
+  const endMs = endDate ? Date.parse(endDate) : NaN;
 
   for (const event of spreadsEvents) {
     const homeScore = teamMatchScore(teamName, event.home_team ?? '');
     const awayScore = teamMatchScore(teamName, event.away_team ?? '');
-    const score = Math.max(homeScore, awayScore);
+    const teamScore = Math.max(homeScore, awayScore);
 
-    if (score >= MIN_MATCH_SCORE && score > bestScore) {
-      bestScore = score;
-      bestEvent = event;
+    if (teamScore < MIN_MATCH_SCORE) continue;
+
+    let dateDiff = 0;
+    if (!isNaN(endMs) && event.commence_time) {
+      dateDiff = Math.abs(Date.parse(event.commence_time) - endMs) / 86400000;
+      if (dateDiff > 3) continue;
+    }
+
+    const betterTeam         = teamScore > bestTeamScore;
+    const sameTeamCloserDate = teamScore === bestTeamScore && dateDiff < bestDateDiff;
+    if (betterTeam || sameTeamCloserDate) {
+      bestTeamScore = teamScore;
+      bestDateDiff  = dateDiff;
+      bestEvent     = event;
     }
   }
 
