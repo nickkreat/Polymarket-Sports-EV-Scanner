@@ -208,7 +208,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       const isSpread = !isChamp && isSpreadQuestion(market.question);
       const isGame   = !isChamp && !isSpread && isGameQuestion(market.question);
 
-      let trueProb, bestBook, bestOdds, noVigProb, totalBooks, event;
+      let trueProb, bestBook, bestOdds, noVigProb, totalBooks, event, bookBreakdown;
 
       // ── Path Spread: spread/handicap question → spread market matching ─────
       // Must be checked BEFORE the H2H path to avoid using moneyline win%
@@ -242,12 +242,13 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           const p = getSpreadProbForTeam(spreadEvt, spreadTeam, targetSpread, deviGMethod);
           if (p) {
             const flip = isNegativeOutcome(market.question);
-            trueProb   = flip ? 1 - p.trueProb : p.trueProb;
-            noVigProb  = p.trueProb;
-            bestBook   = p.bestBook;
-            bestOdds   = p.bestOdds;
-            totalBooks = p.totalBooks;
-            event      = spreadEvt;
+            trueProb      = flip ? 1 - p.trueProb : p.trueProb;
+            noVigProb     = p.trueProb;
+            bestBook      = p.bestBook;
+            bestOdds      = p.bestOdds;
+            totalBooks    = p.totalBooks;
+            event         = spreadEvt;
+            bookBreakdown = p.bookBreakdown;
             console.debug(
               `[Match-Spread] "${market.question}" → ${spreadTeam} spread=${targetSpread}` +
               ` trueProb=${(trueProb * 100).toFixed(1)}% books=${totalBooks}`
@@ -275,12 +276,13 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             const p = getH2HProbForTeam(h2hEvt, parsed.teamA, deviGMethod);
             if (p) {
               const flip = isNegativeOutcome(market.question);
-              trueProb   = flip ? 1 - p.trueProb : p.trueProb;
-              noVigProb  = p.trueProb;
-              bestBook   = p.bestBook;
-              bestOdds   = p.bestOdds;
-              totalBooks = p.totalBooks;
-              event      = h2hEvt;
+              trueProb      = flip ? 1 - p.trueProb : p.trueProb;
+              noVigProb     = p.trueProb;
+              bestBook      = p.bestBook;
+              bestOdds      = p.bestOdds;
+              totalBooks    = p.totalBooks;
+              event         = h2hEvt;
+              bookBreakdown = p.bookBreakdown;
               console.debug(
                 `[Match-H2H] "${market.question}" → ${parsed.teamA} vs ${parsed.teamB}` +
                 ` trueProb=${(trueProb * 100).toFixed(1)}% flip=${flip} books=${totalBooks}`
@@ -305,13 +307,14 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamName}"`);
           continue;
         }
-        const flip = isNegativeOutcome(market.question);
-        trueProb   = flip ? 1 - match.trueProb : match.trueProb;
-        noVigProb  = match.noVigProb;
-        bestBook   = match.bestBook;
-        bestOdds   = match.bestOdds;
-        totalBooks = match.totalBooks;
-        event      = match.event;
+        const flip    = isNegativeOutcome(market.question);
+        trueProb      = flip ? 1 - match.trueProb : match.trueProb;
+        noVigProb     = match.noVigProb;
+        bestBook      = match.bestBook;
+        bestOdds      = match.bestOdds;
+        totalBooks    = match.totalBooks;
+        event         = match.event;
+        bookBreakdown = match.bookBreakdown;
       }
 
       if (trueProb === undefined) {
@@ -367,6 +370,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         volume:     market.volume,
         endDate:    market.endDate,
         event,
+        bookBreakdown,
         isMultiOutcome: false,
         suspiciousEv,
       });
@@ -458,6 +462,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
               volume:         market.volume,
               endDate:        market.endDate,
               event:          h2hEvt,
+              bookBreakdown:  pA.bookBreakdown,
               isMultiOutcome: true,
               isGameMoneyline: true,
               outcomeLabel:   bestSide,
@@ -482,7 +487,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             continue;
           }
 
-          const { trueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
+          const { trueProb, bestBook, bestOdds, noVigProb, totalBooks, event, bookBreakdown } = match;
           const ev = evPercent(trueProb, outcomePrice);
 
           if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
@@ -519,6 +524,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             volume:         market.volume,
             endDate:        market.endDate,
             event,
+            bookBreakdown,
             isMultiOutcome: true,
             outcomeLabel:   outcomeName,
           });
@@ -641,10 +647,11 @@ function getH2HProbForTeam(event, teamName, deviGMethod = 'multiplicative') {
   const matchedOdds = firstH2H?.outcomes?.find(o => teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE)?.price ?? 0;
 
   return {
-    trueProb:   wSum / wTotal,
-    totalBooks: samples.length,
-    bestBook:   sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
-    bestOdds:   matchedOdds,
+    trueProb:      wSum / wTotal,
+    totalBooks:    samples.length,
+    bestBook:      sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
+    bestOdds:      matchedOdds,
+    bookBreakdown: collectBookBreakdown(event, teamName, ['h2h']),
   };
 }
 
@@ -888,11 +895,12 @@ function getSpreadProbForTeam(event, teamName, targetSpread, deviGMethod = 'mult
   const sharpSample = samples.find(s => SHARP_BOOK_KEYS.has(s.bookKey));
 
   return {
-    trueProb:     wSum / wTotal,
-    totalBooks:   samples.length,
-    bestBook:     sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
-    bestOdds:     matchedOdds,
-    matchedPoint: samples[0]?.point ?? null,
+    trueProb:      wSum / wTotal,
+    totalBooks:    samples.length,
+    bestBook:      sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
+    bestOdds:      matchedOdds,
+    matchedPoint:  samples[0]?.point ?? null,
+    bookBreakdown: collectBookBreakdown(event, teamName, ['spreads', 'alternate_spreads']),
   };
 }
 
@@ -1011,14 +1019,15 @@ function searchEvents(name, events, allowedKeys = ['outrights', 'h2h'], deviGMet
           bestScore = score;
           bestData  = {
             trueProb,
-            noVigProb:  trueProb,
-            bestBook:   book.title,
-            bestOdds:   outcome.price,
-            totalBooks: allBookProbs.length,
-            matchScore: score,
-            matchedOutcome: outcome.name,
+            noVigProb:       trueProb,
+            bestBook:        book.title,
+            bestOdds:        outcome.price,
+            totalBooks:      allBookProbs.length,
+            matchScore:      score,
+            matchedOutcome:  outcome.name,
             matchMarketType: market.key,
             event,
+            bookBreakdown:   collectBookBreakdown(event, outcome.name, allowedKeys),
           };
         }
       }
@@ -1034,6 +1043,50 @@ function searchEvents(name, events, allowedKeys = ['outrights', 'h2h'], deviGMet
   }
 
   return bestData;
+}
+
+// Build a per-book odds breakdown for display in the UI.
+// Returns entries sorted: sharp books first, then by noVigProb descending.
+function collectBookBreakdown(event, targetOutcomeName, allowedKeys = ['outrights', 'h2h']) {
+  const seen = new Set();
+  const breakdown = [];
+
+  for (const book of event.bookmakers ?? []) {
+    if (seen.has(book.key)) continue;
+
+    for (const market of book.markets ?? []) {
+      if (!allowedKeys.includes(market.key)) continue;
+
+      const outcomes     = market.outcomes ?? [];
+      const impliedProbs = outcomes.map(o => americanToImplied(o.price));
+      const total        = impliedProbs.reduce((s, p) => s + p, 0);
+      if (total <= 0 || outcomes.length === 0) continue;
+
+      const idx = outcomes.findIndex(
+        o => teamMatchScore(targetOutcomeName, o.name) >= MIN_MATCH_SCORE
+      );
+      if (idx === -1) continue;
+
+      const bookKey = book.key ?? '';
+      seen.add(bookKey);
+      breakdown.push({
+        bookKey,
+        bookTitle:    book.title ?? bookKey,
+        americanOdds: outcomes[idx].price,
+        impliedProb:  impliedProbs[idx],
+        noVigProb:    impliedProbs[idx] / total, // multiplicative devig for display
+        isSharp:      SHARP_BOOK_KEYS.has(bookKey),
+      });
+      break; // one entry per book (take first matching market)
+    }
+  }
+
+  breakdown.sort((a, b) => {
+    if (a.isSharp !== b.isSharp) return a.isSharp ? -1 : 1;
+    return b.noVigProb - a.noVigProb;
+  });
+
+  return breakdown;
 }
 
 // Collect devigged probabilities for a named outcome across all bookmakers in an event.
