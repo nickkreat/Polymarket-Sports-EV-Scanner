@@ -51,13 +51,13 @@ export function useScanner(settings) {
       }
 
       setStatus('scanning — discovering available sports…');
-      const sportKeys = await fetchRelevantSportKeys(settings.oddsApiKey);
-      console.debug(`[Scanner] Sport keys to fetch (${sportKeys.length}):`, sportKeys);
+      const { futuresSportKeys, h2hSportKeys } = await fetchRelevantSportKeys(settings.oddsApiKey);
+      console.debug(`[Scanner] Sport keys: ${futuresSportKeys.length} futures, ${h2hSportKeys.length} H2H`);
 
       setStatus('scanning — fetching sportsbook futures odds…');
       const futuresEvents = await fetchAllFuturesOdds(
         settings.oddsApiKey,
-        sportKeys,
+        futuresSportKeys,
         { regions: settings.preferredRegions }
       );
       console.debug(`[Scanner] Odds API futures: ${futuresEvents.length} events`);
@@ -65,7 +65,7 @@ export function useScanner(settings) {
       setStatus('scanning — fetching sportsbook game odds…');
       const h2hEvents = await fetchAllH2HOdds(
         settings.oddsApiKey,
-        sportKeys,   // use the same dynamically-discovered keys as futures (includes tennis, boxing, MMA)
+        h2hSportKeys,
         { regions: settings.preferredRegions }
       );
       console.debug(`[Scanner] Odds API H2H: ${h2hEvents.length} game events`);
@@ -169,6 +169,13 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
     if (!isSportsMarket(market.question)) {
       stats.skippedNonSports++;
       continue;
+    }
+
+    // Skip markets whose resolution date has already passed.
+    // Their prices are stale/illiquid and the opportunity is no longer actionable.
+    if (market.endDate) {
+      const endMs = Date.parse(market.endDate);
+      if (!isNaN(endMs) && endMs < Date.now()) continue;
     }
 
     // Normalise prices — Polymarket sometimes returns strings
@@ -659,7 +666,13 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', dev
       const title = ((e.home_team ?? '') + ' ' + (e.away_team ?? '')).toLowerCase();
       return title.includes(topicHint);
     });
-    if (topicScoped.length > 0) candidates = topicScoped;
+    if (topicScoped.length > 0) {
+      candidates = topicScoped;
+    } else {
+      // Tournament not present in the API (completed or too far out) — no valid match.
+      // Do NOT fall back to the broader pool; that would match a different tournament.
+      return null;
+    }
   }
 
   return searchEvents(name, candidates, allowedKeys, deviGMethod);

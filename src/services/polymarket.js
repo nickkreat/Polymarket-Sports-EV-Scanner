@@ -119,7 +119,11 @@ function normalizeMarket(m) {
       : outcomes.map(() => 1 / outcomes.length);
   } catch { prices = outcomes.map(() => 1 / outcomes.length); }
 
-  const tags = Array.isArray(m.tags) ? m.tags : [];
+  // The /markets endpoint does not return a top-level tags field — it's always undefined.
+  // Tags live inside the nested events[0].tags object returned by the Gamma API.
+  const rawTags = Array.isArray(m.tags)
+    ? m.tags
+    : Array.isArray(m.events?.[0]?.tags) ? m.events[0].tags : [];
 
   return {
     id:          m.id ?? m.conditionId,
@@ -132,7 +136,7 @@ function normalizeMarket(m) {
     endDate:   m.endDate ?? m.endDateIso ?? null,
     active:    m.active  ?? true,
     closed:    m.closed  ?? false,
-    tags:      tags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
+    tags:      rawTags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
     url:        buildUrl(m),
     slug:       m.events?.[0]?.slug ?? m.groupSlug ?? m.slug ?? '',
     eventTitle: m.events?.[0]?.title ?? null,

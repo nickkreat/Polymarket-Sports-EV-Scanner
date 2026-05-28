@@ -82,12 +82,17 @@ export async function fetchFuturesOdds(sportKey, apiKey, { regions = 'us,us2', b
 }
 
 /**
- * Fetch all sports from The Odds API, filter to ones we care about that have
- * outrights markets, and return their keys.  Falls back to CORE_SPORT_KEYS on
- * any error so a bad API key still produces a useful error message later.
+ * Fetch all sports from The Odds API and split into two key lists:
+ *   futuresSportKeys — sports with has_outrights (for outright/futures markets)
+ *   h2hSportKeys     — all active sports (for game moneylines)
+ *
+ * The old approach filtered only by has_outrights, which threw away every game
+ * sport key (NFL, NBA, MLB, NHL, etc.) because they return has_outrights=false
+ * during stretches when no futures markets are open. Now we keep them separately.
  */
 export async function fetchRelevantSportKeys(apiKey) {
-  if (!apiKey) return CORE_SPORT_KEYS;
+  const FALLBACK = { futuresSportKeys: CORE_SPORT_KEYS, h2hSportKeys: CORE_SPORT_KEYS };
+  if (!apiKey) return FALLBACK;
 
   const cacheKey = `sports|${apiKey}`;
   const cached = _getCached(cacheKey);
@@ -98,28 +103,34 @@ export async function fetchRelevantSportKeys(apiKey) {
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     const res = await fetch(`${BASE}/sports?apiKey=${apiKey}&all=true`, { signal: controller.signal });
     clearTimeout(timer);
-    if (!res.ok) return CORE_SPORT_KEYS;
+    if (!res.ok) return FALLBACK;
 
     const sports = await res.json();
 
-    const relevant = sports
-      .filter(s => s.has_outrights)          // must support futures/outrights
-      .filter(s => {
-        if (CORE_SPORT_KEYS.includes(s.key)) return true;
-        const key   = (s.key   ?? '').toLowerCase();
-        const group = (s.group ?? '').toLowerCase();
-        return (
-          DESIRED_KEY_FRAGMENTS.some(f => key.includes(f)) ||
-          DESIRED_SPORT_GROUPS.some(g => group.toLowerCase() === g.toLowerCase())
-        );
-      })
-      .map(s => s.key);
+    const matchesCriteria = s => {
+      if (CORE_SPORT_KEYS.includes(s.key)) return true;
+      const key   = (s.key   ?? '').toLowerCase();
+      const group = (s.group ?? '').toLowerCase();
+      return (
+        DESIRED_KEY_FRAGMENTS.some(f => key.includes(f)) ||
+        DESIRED_SPORT_GROUPS.some(g => group.toLowerCase() === g.toLowerCase())
+      );
+    };
 
-    const result = relevant.length ? relevant : CORE_SPORT_KEYS;
+    // H2H: all *active* sports matching our criteria (active = has upcoming events)
+    const h2hSportKeys = sports.filter(s => s.active).filter(matchesCriteria).map(s => s.key);
+
+    // Futures: only sports that currently have outright markets
+    const futuresSportKeys = sports.filter(s => s.has_outrights).filter(matchesCriteria).map(s => s.key);
+
+    const result = {
+      futuresSportKeys: futuresSportKeys.length ? futuresSportKeys : CORE_SPORT_KEYS,
+      h2hSportKeys:     h2hSportKeys.length     ? h2hSportKeys     : CORE_SPORT_KEYS,
+    };
     _setCached(cacheKey, result);
     return result;
   } catch {
-    return CORE_SPORT_KEYS;
+    return FALLBACK;
   }
 }
 
