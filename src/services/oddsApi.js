@@ -212,9 +212,10 @@ export async function fetchAllH2HOdds(apiKey, sportKeys = CORE_SPORT_KEYS, optio
 
 /**
  * Fetch spread/handicap odds for a sport.
- * Requests both 'spreads' and 'alternate_spreads' so callers get standard and
- * alternate lines (e.g. MLB -1.5 and -3.5 run lines) in a single API call.
- * Returns [] on 422/404 so callers stay clean.
+ * Makes two separate calls (spreads + alternate_spreads) because the Odds API
+ * does not support comma-separated market types in the markets parameter.
+ * Merges results so each event object carries both market types in its bookmakers.
+ * Returns [] on error so callers stay clean.
  */
 export async function fetchSpreadsOdds(sportKey, apiKey, { regions = 'us,us2' } = {}) {
   if (!apiKey) throw new Error('No Odds API key configured');
@@ -223,30 +224,48 @@ export async function fetchSpreadsOdds(sportKey, apiKey, { regions = 'us,us2' } 
   const cached = _getCached(cacheKey);
   if (cached) return cached;
 
-  const params = new URLSearchParams({
-    apiKey,
-    regions,
-    markets: 'spreads,alternate_spreads',
-    oddsFormat: 'american',
+  const now = Date.now();
+
+  const fetchOne = async (marketType) => {
+    const params = new URLSearchParams({ apiKey, regions, markets: marketType, oddsFormat: 'american' });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`, { signal: controller.signal })
+      .finally(() => clearTimeout(timer));
+    if (res.status === 422 || res.status === 404) return [];
+    if (!res.ok) return [];
+    return (await res.json()).filter(
+      e => !e.commence_time || new Date(e.commence_time).getTime() >= now
+    );
+  };
+
+  const [spreadsData, altSpreadsData] = await Promise.all([
+    fetchOne('spreads').catch(() => []),
+    fetchOne('alternate_spreads').catch(() => []),
+  ]);
+
+  // Merge alt_spreads markets into matching base events
+  const altByEventId = new Map(altSpreadsData.map(e => [e.id, e]));
+  const merged = spreadsData.map(event => {
+    const alt = altByEventId.get(event.id);
+    if (!alt) return event;
+    const mergedBookmakers = event.bookmakers.map(book => {
+      const altBook    = alt.bookmakers?.find(b => b.key === book.key);
+      const altMarkets = altBook?.markets?.filter(m => m.key === 'alternate_spreads') ?? [];
+      return { ...book, markets: [...(book.markets ?? []), ...altMarkets] };
+    });
+    const baseBookKeys = new Set(event.bookmakers.map(b => b.key));
+    const extraBooks   = (alt.bookmakers ?? []).filter(b => !baseBookKeys.has(b.key));
+    return { ...event, bookmakers: [...mergedBookmakers, ...extraBooks] };
   });
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`, { signal: controller.signal })
-    .finally(() => clearTimeout(timer));
+  // Include events that only appear in alt data (no base spread line)
+  const baseEventIds = new Set(spreadsData.map(e => e.id));
+  const altOnly = altSpreadsData.filter(e => !baseEventIds.has(e.id));
 
-  if (res.status === 422 || res.status === 404) return [];
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Odds API ${res.status} for ${sportKey} spreads: ${body}`);
-  }
-
-  const now  = Date.now();
-  const data = (await res.json()).filter(
-    e => !e.commence_time || new Date(e.commence_time).getTime() >= now
-  );
-  _setCached(cacheKey, data);
-  return data;
+  const result = [...merged, ...altOnly];
+  if (result.length > 0) _setCached(cacheKey, result);
+  return result;
 }
 
 /**

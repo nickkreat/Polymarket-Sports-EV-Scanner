@@ -521,6 +521,8 @@ export function isSportsMarket(question) {
 // Returns the canonical name, or null if no pattern matched.
 export function extractTeamFromQuestion(question) {
   const patterns = [
+    // "Spread: White Sox (-3.5)" / "Set Handicap: Berrettini (-2.5)" — team before point spread
+    /^(?:spread|set handicap|run line|puck line|handicap):\s*(.+?)\s*\([+-]?\d/i,
     // "Will the Heat beat/defeat/top/overcome the Celtics?"
     /will (?:the )?(.+?) (?:beat|defeat|overcome|outperform|top|outplay|outlast)/i,
     // "Will the Chiefs win/make/advance/clinch…?"

@@ -190,9 +190,11 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
     // Normalise prices — Polymarket sometimes returns strings
     const normPrices = prices.map(Number);
 
-    // Skip near-resolved markets (one outcome already at 99.5¢+).
-    // Their edges are illusory — a tiny pricing error gets amplified to huge EV%.
-    if (normPrices.some(p => p < 0.005 || p > 0.995)) continue;
+    // Skip near-resolved markets (tightened to 1¢/99¢ — catches prices not yet at 0/1)
+    if (normPrices.some(p => p < 0.01 || p > 0.99)) continue;
+
+    // Skip completed/settled matches — prices are certain and no longer actionable
+    if (/\b(?:completed?\s+match|completed?\s+game|final\s+score)\b/i.test(market.question)) continue;
 
     if (isBinaryYesNo(outcomes)) {
       // ── Binary YES/NO market ───────────────────────────────────────────────
@@ -383,8 +385,11 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       //   B) Futures/outright: 3+ outcomes or non-team 2-outcome market
       //      → match each outcome individually against outrights
 
-      const isGameMoneyline = (() => {
+      // Two-team spread market (e.g. "Spread: White Sox (-3.5)" outcomes: ["White Sox","Twins"])
+      // Must be checked BEFORE isGameMoneyline to prevent routing to H2H moneyline pool.
+      const isTwoTeamSpread = (() => {
         if (outcomes.length !== 2) return false;
+        if (!isSpreadQuestion(market.question)) return false;
         const lower = outcomes.map(o => String(o).toLowerCase().trim());
         const nonTeam = ['over', 'under', 'odd', 'even', 'yes', 'no', 'draw'];
         if (lower.some(o => nonTeam.includes(o) || /^\d/.test(o))) return false;
@@ -393,7 +398,114 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         return ca && cb && ca !== cb && ca.length > 2 && cb.length > 2;
       })();
 
-      if (isGameMoneyline) {
+      const isGameMoneyline = (() => {
+        if (outcomes.length !== 2) return false;
+        // Guard: spread/totals markets have two team names but are NOT moneylines
+        if (isSpreadQuestion(market.question)) return false;
+        if (isTotalsQuestion(market.question)) return false;
+        const lower = outcomes.map(o => String(o).toLowerCase().trim());
+        const nonTeam = ['over', 'under', 'odd', 'even', 'yes', 'no', 'draw'];
+        if (lower.some(o => nonTeam.includes(o) || /^\d/.test(o))) return false;
+        const ca = canonicalTeamName(lower[0]);
+        const cb = canonicalTeamName(lower[1]);
+        return ca && cb && ca !== cb && ca.length > 2 && cb.length > 2;
+      })();
+
+      if (isTwoTeamSpread) {
+        // ── Case Spread: Two-team spread/handicap market ───────────────────
+        // e.g. "Spread: White Sox (-3.5)" → outcomes: ["White Sox","Twins"]
+        stats.multiChecked += 2;
+        const targetSpread = extractSpreadFromQuestion(market.question);
+        const teamA  = canonicalTeamName(String(outcomes[0]));
+        const teamB  = canonicalTeamName(String(outcomes[1]));
+        const priceA = normPrices[0];
+        const priceB = normPrices[1];
+
+        if (!priceA || priceA <= 0 || priceA >= 1) continue;
+
+        const spreadsPool = oddsEvents.filter(e =>
+          e.bookmakers?.some(b => b.markets?.some(m =>
+            m.key === 'spreads' || m.key === 'alternate_spreads'
+          ))
+        );
+        const spreadEvt = findH2HEvent(teamA, teamB, spreadsPool);
+
+        if (!spreadEvt) {
+          stats.multiNoOddsMatch++;
+          console.debug(`[Scanner] No spread event: "${market.question}" → ${teamA} vs ${teamB}`);
+          continue;
+        }
+
+        const pA = getSpreadProbForTeam(spreadEvt, teamA, targetSpread, deviGMethod);
+        if (!pA) {
+          stats.multiNoOddsMatch++;
+          console.debug(`[Scanner] No spread prob: "${market.question}" spread=${targetSpread}`);
+          continue;
+        }
+
+        const evA = evPercent(pA.trueProb, priceA);
+        const evB = evPercent(1 - pA.trueProb, priceB);
+        const bestSide      = evA >= evB ? teamA : teamB;
+        const bestEv        = bestSide === teamA ? evA : evB;
+        const bestPrice     = bestSide === teamA ? priceA : priceB;
+        const bestTrueProb  = bestSide === teamA ? pA.trueProb : 1 - pA.trueProb;
+
+        if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
+        if (!settings.showNegativeEv && bestEv <= 0)  { stats.filteredEv++; continue; }
+        if (bestEv < settings.minEvPct)               { stats.filteredEv++; continue; }
+
+        const suspiciousEv = Math.abs(bestEv) > 200;
+        if (suspiciousEv) {
+          console.warn(`[Scanner] Extreme EV ${bestEv.toFixed(0)}% — verify: "${market.question}"`);
+          if (settings.hideSuspiciousEv) { stats.filteredEv++; continue; }
+        }
+
+        const kellySizing = kellySizingYes({ trueProb: bestTrueProb, marketPrice: bestPrice, bankroll, fraction });
+        const cappedPct   = Math.min(kellySizing.adjustedPct, maxKellyPct);
+
+        console.debug(
+          `[Match-Spread2T] "${market.question}" → ${teamA} vs ${teamB}` +
+          ` spread=${targetSpread} matchedPoint=${pA.matchedPoint}` +
+          ` bestSide=${bestSide} EV=${bestEv.toFixed(1)}% books=${pA.totalBooks}`
+        );
+
+        results.push({
+          id:               `${market.id}-spread`,
+          question:         market.question,
+          url:              market.url,
+          sport:            inferSport(market.tags, spreadEvt?.sport_key),
+          side:             bestSide,
+          evPct:            bestEv,
+          marketPrice:      bestPrice,
+          trueProb:         bestTrueProb,
+          noVigProb:        pA.trueProb,
+          yesPrice:         priceA,
+          noPrice:          priceB,
+          yesEv:            evA,
+          noEv:             evB,
+          bestBook:         pA.bestBook,
+          bestOdds:         pA.bestOdds,
+          totalBooks:       pA.totalBooks,
+          kelly: {
+            fullKellyPct: kellySizing.kellyPct,
+            adjustedPct:  cappedPct,
+            betSize:      cappedPct * bankroll,
+            fraction,
+          },
+          liquidity:        market.liquidity,
+          volume:           market.volume,
+          endDate:          market.endDate,
+          event:            spreadEvt,
+          bookBreakdown:    pA.bookBreakdown,
+          isMultiOutcome:   true,
+          isSpreadMarket:   true,
+          matchedSpreadPoint: pA.matchedPoint,
+          outcomeLabel:     bestSide,
+          suspiciousEv,
+        });
+        continue; // don't fall through to isGameMoneyline
+
+      } else if (isGameMoneyline) {
         // ── Case A: Game moneyline ─────────────────────────────────────────
         stats.multiChecked += 2;
         const teamA  = canonicalTeamName(String(outcomes[0]));
@@ -775,8 +887,10 @@ function isSpreadQuestion(question) {
     /\brun\s*line\b/.test(q) ||
     /\bpuck\s*line\b/.test(q) ||
     /\balt(?:ernate)?\s+spread\b/.test(q) ||
-    // "Berrettini (-2.5)" or "(+3.5)" — point spread in parens
-    /\([+-]?\d+(?:\.\d+)?\)/.test(question)
+    // Explicit spread notation in parens: requires sign (+/-) or decimal
+    // to avoid matching game/series numbers like "(7)" or "(if necessary)"
+    /\([+-]\d+(?:\.\d+)?\)/.test(question) ||
+    /\(\d+\.\d+\)/.test(question)
   );
 }
 
@@ -884,21 +998,30 @@ function getSpreadProbForTeam(event, teamName, targetSpread, deviGMethod = 'mult
     wTotal += w;
   }
 
-  // Best odds: first spread market, team's outcome price
-  const firstSpreadMkt = event.bookmakers
-    ?.flatMap(b => b.markets ?? [])
-    .find(m => spreadKeys.includes(m.key));
-  const matchedOdds = firstSpreadMkt?.outcomes?.find(o =>
-    teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE
-  )?.price ?? 0;
-
   const sharpSample = samples.find(s => SHARP_BOOK_KEYS.has(s.bookKey));
+  const bestSampleS = sharpSample ?? samples[0];
+
+  // Get bestOdds from the actual sharp/best book (not just the first book in the list)
+  let bestOddsS = 0;
+  if (bestSampleS) {
+    outer: for (const book of event.bookmakers ?? []) {
+      if (book.key !== bestSampleS.bookKey) continue;
+      for (const market of book.markets ?? []) {
+        if (!spreadKeys.includes(market.key)) continue;
+        const o = market.outcomes?.find(o =>
+          teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE &&
+          (targetSpread === null || Math.abs((o.point ?? 0) - targetSpread) <= SPREAD_TOLERANCE)
+        );
+        if (o) { bestOddsS = o.price; break outer; }
+      }
+    }
+  }
 
   return {
     trueProb:      wSum / wTotal,
     totalBooks:    samples.length,
-    bestBook:      sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
-    bestOdds:      matchedOdds,
+    bestBook:      bestSampleS?.bookTitle ?? '',
+    bestOdds:      bestOddsS,
     matchedPoint:  samples[0]?.point ?? null,
     bookBreakdown: collectBookBreakdown(event, teamName, ['spreads', 'alternate_spreads']),
   };
@@ -920,8 +1043,7 @@ function isGameQuestion(question) {
   return (
     /\b(beat|defeat|vs\.?|against)\b/.test(q) ||
     /\bgame\s+[1-7]\b/.test(q) ||
-    /\b(tonight|tomorrow|moneyline|spread|cover)\b/.test(q) ||
-    // "Lakers at Celtics" / "Rockets @ Spurs"
+    /\b(tonight|tomorrow|moneyline)\b/.test(q) ||
     /\b[a-z]+ (?:at|@) [a-z]+\b/.test(q)
   );
 }
