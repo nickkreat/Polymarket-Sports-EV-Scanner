@@ -304,62 +304,153 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       });
 
     } else if (outcomes.length >= 2) {
-      // ── Multi-outcome market (e.g. "Who wins the Masters?") ───────────────
-      // Each outcome IS the player/team name; treat each as a separate bet.
-      for (let i = 0; i < outcomes.length; i++) {
-        stats.multiChecked++;
-        const outcomeName  = String(outcomes[i]);
-        const outcomePrice = normPrices[i];
+      // ── Multi-outcome market ──────────────────────────────────────────────
+      // Two cases:
+      //   A) Game moneyline: exactly 2 team-name outcomes (e.g. ["Thunder","Spurs"])
+      //      → find the exact H2H event via dual-team matching
+      //   B) Futures/outright: 3+ outcomes or non-team 2-outcome market
+      //      → match each outcome individually against outrights
 
-        if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
-        if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
+      const isGameMoneyline = (() => {
+        if (outcomes.length !== 2) return false;
+        const lower = outcomes.map(o => String(o).toLowerCase().trim());
+        const nonTeam = ['over', 'under', 'odd', 'even', 'yes', 'no', 'draw'];
+        if (lower.some(o => nonTeam.includes(o) || /^\d/.test(o))) return false;
+        const ca = canonicalTeamName(lower[0]);
+        const cb = canonicalTeamName(lower[1]);
+        return ca && cb && ca !== cb && ca.length > 2 && cb.length > 2;
+      })();
 
-        const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question, deviGMethod);
-        if (!match) {
-          stats.multiNoOddsMatch++;
-          continue;
+      if (isGameMoneyline) {
+        // ── Case A: Game moneyline ─────────────────────────────────────────
+        stats.multiChecked += 2;
+        const teamA  = canonicalTeamName(String(outcomes[0]));
+        const teamB  = canonicalTeamName(String(outcomes[1]));
+        const priceA = normPrices[0];
+        const priceB = normPrices[1];
+
+        if (!priceA || priceA <= 0 || priceA >= 1) continue;
+
+        const h2hPool = oddsEvents.filter(e =>
+          e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
+        );
+        const h2hEvt = findH2HEvent(teamA, teamB, h2hPool);
+
+        if (h2hEvt) {
+          const pA = getH2HProbForTeam(h2hEvt, teamA, deviGMethod);
+          if (pA) {
+            const evA      = evPercent(pA.trueProb, priceA);
+            const evB      = evPercent(1 - pA.trueProb, priceB);
+            const bestSide = evA >= evB ? teamA : teamB;
+            const bestEv   = bestSide === teamA ? evA : evB;
+            const bestPrice     = bestSide === teamA ? priceA : priceB;
+            const bestTrueProb  = bestSide === teamA ? pA.trueProb : 1 - pA.trueProb;
+
+            if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
+            if (!settings.showNegativeEv && bestEv <= 0)  { stats.filteredEv++; continue; }
+            if (bestEv < settings.minEvPct)               { stats.filteredEv++; continue; }
+
+            const suspiciousEv = Math.abs(bestEv) > 200;
+            const kellySizing  = kellySizingYes({ trueProb: bestTrueProb, marketPrice: bestPrice, bankroll, fraction });
+            const cappedPct    = Math.min(kellySizing.adjustedPct, maxKellyPct);
+
+            console.debug(
+              `[Match-Game] "${market.question}" → ${teamA} vs ${teamB}` +
+              ` bestSide=${bestSide} EV=${bestEv.toFixed(1)}% books=${pA.totalBooks}`
+            );
+
+            results.push({
+              id:          `${market.id}-ml`,
+              question:    market.question,
+              url:         market.url,
+              sport:       inferSport(market.tags, h2hEvt?.sport_key),
+              side:        bestSide,
+              evPct:       bestEv,
+              marketPrice: bestPrice,
+              trueProb:    bestTrueProb,
+              noVigProb:   pA.trueProb,
+              yesPrice:    priceA,
+              noPrice:     priceB,
+              yesEv:       evA,
+              noEv:        evB,
+              bestBook:    pA.bestBook,
+              bestOdds:    pA.bestOdds,
+              totalBooks:  pA.totalBooks,
+              kelly: {
+                fullKellyPct: kellySizing.kellyPct,
+                adjustedPct:  cappedPct,
+                betSize:      cappedPct * bankroll,
+                fraction,
+              },
+              liquidity:      market.liquidity,
+              volume:         market.volume,
+              endDate:        market.endDate,
+              event:          h2hEvt,
+              isMultiOutcome: true,
+              isGameMoneyline: true,
+              outcomeLabel:   bestSide,
+              suspiciousEv,
+            });
+          }
         }
 
-        const { trueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
-        const ev = evPercent(trueProb, outcomePrice);
+      } else {
+        // ── Case B: Futures/outright with named outcomes ───────────────────
+        for (let i = 0; i < outcomes.length; i++) {
+          stats.multiChecked++;
+          const outcomeName  = String(outcomes[i]);
+          const outcomePrice = normPrices[i];
 
-        if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
-        if (!settings.showNegativeEv && ev <= 0)      { stats.filteredEv++; continue; }
-        if (ev < settings.minEvPct)                   { stats.filteredEv++; continue; }
+          if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
+          if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
 
-        const kellySizing = kellySizingYes({ trueProb, marketPrice: outcomePrice, bankroll, fraction });
-        const cappedPct   = Math.min(kellySizing.adjustedPct, maxKellyPct);
+          const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question, deviGMethod);
+          if (!match) {
+            stats.multiNoOddsMatch++;
+            continue;
+          }
 
-        results.push({
-          id:       `${market.id}-${i}`,
-          question: market.question,
-          url:      market.url,
-          sport:    inferSport(market.tags, event?.sport_key),
-          side:     outcomeName,
-          evPct:    ev,
-          marketPrice: outcomePrice,
-          trueProb,
-          noVigProb,
-          yesPrice:  outcomePrice,
-          noPrice:   1 - outcomePrice,
-          yesEv:     ev,
-          noEv:      evPercent(1 - trueProb, 1 - outcomePrice),
-          bestBook,
-          bestOdds,
-          totalBooks,
-          kelly: {
-            fullKellyPct: kellySizing.kellyPct,
-            adjustedPct:  cappedPct,
-            betSize:      cappedPct * bankroll,
-            fraction,
-          },
-          liquidity:  market.liquidity,
-          volume:     market.volume,
-          endDate:    market.endDate,
-          event,
-          isMultiOutcome: true,
-          outcomeLabel: outcomeName,
-        });
+          const { trueProb, bestBook, bestOdds, noVigProb, totalBooks, event } = match;
+          const ev = evPercent(trueProb, outcomePrice);
+
+          if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
+          if (!settings.showNegativeEv && ev <= 0)      { stats.filteredEv++; continue; }
+          if (ev < settings.minEvPct)                   { stats.filteredEv++; continue; }
+
+          const kellySizing = kellySizingYes({ trueProb, marketPrice: outcomePrice, bankroll, fraction });
+          const cappedPct   = Math.min(kellySizing.adjustedPct, maxKellyPct);
+
+          results.push({
+            id:       `${market.id}-${i}`,
+            question: market.question,
+            url:      market.url,
+            sport:    inferSport(market.tags, event?.sport_key),
+            side:     outcomeName,
+            evPct:    ev,
+            marketPrice: outcomePrice,
+            trueProb,
+            noVigProb,
+            yesPrice:  outcomePrice,
+            noPrice:   1 - outcomePrice,
+            yesEv:     ev,
+            noEv:      evPercent(1 - trueProb, 1 - outcomePrice),
+            bestBook,
+            bestOdds,
+            totalBooks,
+            kelly: {
+              fullKellyPct: kellySizing.kellyPct,
+              adjustedPct:  cappedPct,
+              betSize:      cappedPct * bankroll,
+              fraction,
+            },
+            liquidity:      market.liquidity,
+            volume:         market.volume,
+            endDate:        market.endDate,
+            event,
+            isMultiOutcome: true,
+            outcomeLabel:   outcomeName,
+          });
+        }
       }
     }
   }

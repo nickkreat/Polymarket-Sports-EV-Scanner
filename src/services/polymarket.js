@@ -3,8 +3,6 @@ const FETCH_TIMEOUT_MS = 10000;
 const PAGE_SIZE = 100;
 
 // Only tag slugs confirmed to exist in Polymarket's Gamma API.
-// Fake/guessed slugs (nba-playoffs, premier-league, etc.) cause HTTP 500
-// errors on every paginated request and flood the console.
 const SPORTS_TAG_SLUGS = [
   'nfl', 'nba', 'mlb', 'nhl',
   'ncaaf', 'ncaab',
@@ -14,8 +12,7 @@ const SPORTS_TAG_SLUGS = [
   'sports',
 ];
 
-// Cap per-tag pagination at 300.  Most sport tags have far fewer than 300
-// active markets; going to 1000 just generates 500 errors at high offsets.
+// Cap per-tag pagination at 300 events.
 const MAX_PER_TAG = 300;
 
 export async function fetchSportsMarkets(options = {}) {
@@ -25,7 +22,7 @@ export async function fetchSportsMarkets(options = {}) {
   } = options;
 
   const settled = await Promise.allSettled(
-    sports.map(tag => fetchTag(tag, activeOnly))
+    sports.map(tag => fetchEventsByTag(tag, activeOnly))
   );
 
   const seen       = new Set();
@@ -44,7 +41,12 @@ export async function fetchSportsMarkets(options = {}) {
   return allMarkets;
 }
 
-async function fetchTag(tag, activeOnly) {
+// Fetch via the /events endpoint (which correctly filters by tag_slug) and
+// extract all markets from the nested events[].markets array.
+// The /markets?tag_slug= endpoint is broken server-side — it returns the same
+// irrelevant data (GTA VI, Harvey Weinstein, etc.) regardless of which tag is
+// requested. The /events endpoint works correctly.
+async function fetchEventsByTag(tag, activeOnly) {
   const items = [];
 
   for (let offset = 0; offset < MAX_PER_TAG; offset += PAGE_SIZE) {
@@ -60,20 +62,27 @@ async function fetchTag(tag, activeOnly) {
         offset:   String(offset),
       });
 
-      const res = await fetch(`${GAMMA_API}/markets?${params}`, {
+      const res = await fetch(`${GAMMA_API}/events?${params}`, {
         headers: { Accept: 'application/json' },
         signal:  controller.signal,
       });
 
       if (!res.ok) break;
 
-      const data = await res.json();
-      const page = Array.isArray(data) ? data : data.markets ?? data.data ?? [];
-      if (page.length === 0) break;
+      const data   = await res.json();
+      const events = Array.isArray(data) ? data : data.events ?? data.data ?? [];
+      if (events.length === 0) break;
 
-      items.push(...page.map(normalizeMarket));
+      // Each event contains a markets array — flatten them all, injecting the
+      // parent event so normalizeMarket can read its slug and tags.
+      for (const event of events) {
+        if (!Array.isArray(event.markets)) continue;
+        for (const market of event.markets) {
+          items.push(normalizeMarket({ ...market, _parentEvent: event }));
+        }
+      }
 
-      if (page.length < PAGE_SIZE) break;
+      if (events.length < PAGE_SIZE) break;
     } catch {
       break;
     } finally {
@@ -85,18 +94,16 @@ async function fetchTag(tag, activeOnly) {
 }
 
 function buildUrl(m) {
-  // m.url is the most reliable source — use it if it's an absolute URL
   if (m.url && m.url.startsWith('http')) return m.url;
   if (m.url && m.url.startsWith('/'))    return `https://polymarket.com${m.url}`;
 
-  // The Gamma API embeds the canonical event slug in m.events[0].slug.
-  // This differs from m.slug (market/outcome slug) for group markets, e.g.:
-  //   m.slug   = "will-okc-win-the-2026-nba-finals"  ← 404s
-  //   events[0].slug = "2026-nba-champion"            ← resolves correctly
-  const eventSlug = m.events?.[0]?.slug ?? null;
+  // When fetched via /events, the parent event slug is the canonical URL slug.
+  const eventSlug =
+    m._parentEvent?.slug ??  // injected by fetchEventsByTag
+    m.events?.[0]?.slug ??   // fallback when fetched via /markets/{id}
+    null;
   if (eventSlug) return `https://polymarket.com/event/${eventSlug}`;
 
-  // Fallback for markets with no events array
   const marketSlug = m.groupSlug ?? m.slug ?? String(m.id ?? '');
   const cleanSlug  = marketSlug.replace(/[_-](yes|no|\d+)$/i, '');
   return `https://polymarket.com/event/${cleanSlug}`;
@@ -119,11 +126,11 @@ function normalizeMarket(m) {
       : outcomes.map(() => 1 / outcomes.length);
   } catch { prices = outcomes.map(() => 1 / outcomes.length); }
 
-  // The /markets endpoint does not return a top-level tags field — it's always undefined.
-  // Tags live inside the nested events[0].tags object returned by the Gamma API.
-  const rawTags = Array.isArray(m.tags)
-    ? m.tags
-    : Array.isArray(m.events?.[0]?.tags) ? m.events[0].tags : [];
+  // Tags come from the injected _parentEvent (set by fetchEventsByTag) or from
+  // the events[0] sub-object when fetched via /markets/{id}.
+  // The /markets endpoint never returns a top-level tags field.
+  const parentEvent = m._parentEvent ?? m.events?.[0] ?? null;
+  const rawTags     = Array.isArray(parentEvent?.tags) ? parentEvent.tags : [];
 
   return {
     id:          m.id ?? m.conditionId,
@@ -131,15 +138,15 @@ function normalizeMarket(m) {
     description: m.description ?? '',
     outcomes,
     prices,
-    volume:    parseFloat(m.volume    ?? m.volumeNum    ?? 0),
-    liquidity: parseFloat(m.liquidity ?? m.liquidityNum ?? 0),
-    endDate:   m.endDate ?? m.endDateIso ?? null,
-    active:    m.active  ?? true,
-    closed:    m.closed  ?? false,
-    tags:      rawTags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
+    volume:     parseFloat(m.volume    ?? m.volumeNum    ?? 0),
+    liquidity:  parseFloat(m.liquidity ?? m.liquidityNum ?? 0),
+    endDate:    m.endDate ?? m.endDateIso ?? null,
+    active:     m.active  ?? true,
+    closed:     m.closed  ?? false,
+    tags:       rawTags.map(t => (typeof t === 'string' ? t : t.slug ?? t.label ?? '')),
     url:        buildUrl(m),
-    slug:       m.events?.[0]?.slug ?? m.groupSlug ?? m.slug ?? '',
-    eventTitle: m.events?.[0]?.title ?? null,
+    slug:       parentEvent?.slug ?? m.groupSlug ?? m.slug ?? '',
+    eventTitle: parentEvent?.title ?? null,
   };
 }
 
