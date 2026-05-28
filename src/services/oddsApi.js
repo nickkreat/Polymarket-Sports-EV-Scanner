@@ -211,6 +211,62 @@ export async function fetchAllH2HOdds(apiKey, sportKeys = CORE_SPORT_KEYS, optio
 }
 
 /**
+ * Fetch spread/handicap odds for a sport.
+ * Requests both 'spreads' and 'alternate_spreads' so callers get standard and
+ * alternate lines (e.g. MLB -1.5 and -3.5 run lines) in a single API call.
+ * Returns [] on 422/404 so callers stay clean.
+ */
+export async function fetchSpreadsOdds(sportKey, apiKey, { regions = 'us,us2' } = {}) {
+  if (!apiKey) throw new Error('No Odds API key configured');
+
+  const cacheKey = `spreads|${sportKey}|${regions}`;
+  const cached = _getCached(cacheKey);
+  if (cached) return cached;
+
+  const params = new URLSearchParams({
+    apiKey,
+    regions,
+    markets: 'spreads,alternate_spreads',
+    oddsFormat: 'american',
+  });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`, { signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+
+  if (res.status === 422 || res.status === 404) return [];
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Odds API ${res.status} for ${sportKey} spreads: ${body}`);
+  }
+
+  const now  = Date.now();
+  const data = (await res.json()).filter(
+    e => !e.commence_time || new Date(e.commence_time).getTime() >= now
+  );
+  _setCached(cacheKey, data);
+  return data;
+}
+
+/**
+ * Fetch spread/handicap odds for a list of sport keys in parallel.
+ */
+export async function fetchAllSpreadsOdds(apiKey, sportKeys = CORE_SPORT_KEYS, options = {}) {
+  const results = await Promise.allSettled(
+    sportKeys.map(sk => fetchSpreadsOdds(sk, apiKey, options))
+  );
+
+  const events = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      events.push(...r.value);
+    }
+  }
+  return events;
+}
+
+/**
  * Fetch all available sports from The Odds API (includes in-season flag).
  */
 export async function fetchAvailableSports(apiKey) {

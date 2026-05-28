@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { fetchSportsMarkets } from '../services/polymarket';
-import { fetchAllFuturesOdds, fetchAllH2HOdds, fetchRelevantSportKeys } from '../services/oddsApi';
+import { fetchAllFuturesOdds, fetchAllH2HOdds, fetchAllSpreadsOdds, fetchRelevantSportKeys } from '../services/oddsApi';
 import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
 import { extractTeamFromQuestion, canonicalTeamName, teamMatchScore, isSportsMarket } from '../utils/matching';
@@ -70,8 +70,16 @@ export function useScanner(settings) {
       );
       console.debug(`[Scanner] Odds API H2H: ${h2hEvents.length} game events`);
 
-      const oddsEvents = [...futuresEvents, ...h2hEvents];
-      console.debug(`[Scanner] Odds API total: ${oddsEvents.length} events (${futuresEvents.length} futures + ${h2hEvents.length} games)`);
+      setStatus('scanning — fetching sportsbook spread/handicap odds…');
+      const spreadsEvents = await fetchAllSpreadsOdds(
+        settings.oddsApiKey,
+        h2hSportKeys,
+        { regions: settings.preferredRegions }
+      );
+      console.debug(`[Scanner] Odds API spreads: ${spreadsEvents.length} spread events`);
+
+      const oddsEvents = [...futuresEvents, ...h2hEvents, ...spreadsEvents];
+      console.debug(`[Scanner] Odds API total: ${oddsEvents.length} events (${futuresEvents.length} futures + ${h2hEvents.length} H2H + ${spreadsEvents.length} spreads)`);
       if (oddsEvents.length > 0) {
         console.debug('[Scanner] Sample events:', oddsEvents.slice(0, 5).map(e => ({
           sport: e.sport_key,
@@ -94,6 +102,7 @@ export function useScanner(settings) {
         oddsEventsScanned:        oddsEvents.length,
         futuresEventsScanned:     futuresEvents.length,
         h2hEventsScanned:         h2hEvents.length,
+        spreadsEventsScanned:     spreadsEvents.length,
         skippedNonSports:         stats.skippedNonSports,
         binaryMarketsChecked:     stats.binaryChecked,
         binaryNoQuestionMatch:    stats.binaryNoQuestion,
@@ -195,10 +204,64 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 
       if (!yesPrice || yesPrice <= 0 || yesPrice >= 1) continue;
 
-      const isChamp = isChampionshipQuestion(market.question);
-      const isGame  = !isChamp && isGameQuestion(market.question);
+      const isChamp  = isChampionshipQuestion(market.question);
+      const isSpread = !isChamp && isSpreadQuestion(market.question);
+      const isGame   = !isChamp && !isSpread && isGameQuestion(market.question);
 
       let trueProb, bestBook, bestOdds, noVigProb, totalBooks, event;
+
+      // ── Path Spread: spread/handicap question → spread market matching ─────
+      // Must be checked BEFORE the H2H path to avoid using moneyline win%
+      // as the reference probability for covering a spread.
+      if (isSpread) {
+        const targetSpread = extractSpreadFromQuestion(market.question);
+        const spreadsPool  = oddsEvents.filter(e =>
+          e.bookmakers?.some(b => b.markets?.some(m => m.key === 'spreads' || m.key === 'alternate_spreads'))
+        );
+
+        let spreadEvt  = null;
+        let spreadTeam = null;
+
+        // Try dual-team parse for accurate event matching
+        const parsed = parseGameQuestion(market.question);
+        if (parsed) {
+          spreadEvt  = findH2HEvent(parsed.teamA, parsed.teamB, spreadsPool);
+          spreadTeam = parsed.teamA;
+        }
+
+        // Fallback: single-team search (e.g. "Will the Pirates cover -3.5?")
+        if (!spreadEvt) {
+          const teamName = extractTeamFromQuestion(market.question);
+          if (teamName) {
+            spreadEvt  = findSpreadEventForTeam(teamName, spreadsPool);
+            spreadTeam = teamName;
+          }
+        }
+
+        if (spreadEvt && spreadTeam) {
+          const p = getSpreadProbForTeam(spreadEvt, spreadTeam, targetSpread, deviGMethod);
+          if (p) {
+            const flip = isNegativeOutcome(market.question);
+            trueProb   = flip ? 1 - p.trueProb : p.trueProb;
+            noVigProb  = p.trueProb;
+            bestBook   = p.bestBook;
+            bestOdds   = p.bestOdds;
+            totalBooks = p.totalBooks;
+            event      = spreadEvt;
+            console.debug(
+              `[Match-Spread] "${market.question}" → ${spreadTeam} spread=${targetSpread}` +
+              ` trueProb=${(trueProb * 100).toFixed(1)}% books=${totalBooks}`
+            );
+          }
+        }
+
+        // Never fall back to H2H for spread questions — moneyline win% ≠ cover%
+        if (trueProb === undefined) {
+          stats.binaryNoOddsMatch++;
+          console.debug(`[Scanner] No spread odds match for: "${market.question}" spread=${targetSpread}`);
+          continue;
+        }
+      }
 
       // ── Path A: game question → dual-team H2H matching ────────────────────
       if (isGame) {
@@ -694,6 +757,145 @@ function extractEventTopic(question) {
   return null;
 }
 
+// ── Spread / totals question classifiers ──────────────────────────────────────
+
+function isSpreadQuestion(question) {
+  const q = question.toLowerCase();
+  return (
+    /\bcover(?:ing)?\b/.test(q) ||
+    /\bspread\b/.test(q) ||
+    /\bhandicap\b/.test(q) ||
+    /\brun\s*line\b/.test(q) ||
+    /\bpuck\s*line\b/.test(q) ||
+    /\balt(?:ernate)?\s+spread\b/.test(q) ||
+    // "Berrettini (-2.5)" or "(+3.5)" — point spread in parens
+    /\([+-]?\d+(?:\.\d+)?\)/.test(question)
+  );
+}
+
+function isTotalsQuestion(question) {
+  const q = question.toLowerCase();
+  return /\b(over|under)\s+\d/.test(q) || /\btotal\b.*\d/.test(q);
+}
+
+// Extract the numeric point spread from a Polymarket question.
+// Returns a float (e.g. -3.5, +2.5) or null if not found.
+function extractSpreadFromQuestion(question) {
+  let m;
+  // "Berrettini (-2.5)" or "(+3.5)"
+  m = question.match(/\(([+-]?\d+(?:\.\d+)?)\)/);
+  if (m) return parseFloat(m[1]);
+
+  // "cover -3.5" or "cover the -3.5"
+  m = question.match(/cover\s+(?:the\s+)?([+-]?\d+(?:\.\d+)?)/i);
+  if (m) return parseFloat(m[1]);
+
+  // "-3.5 run line" / "-3.5 puck line" / "-3.5 set handicap"
+  m = question.match(/([+-]?\d+(?:\.\d+)?)\s+(?:run\s*line|puck\s*line|set\s*handicap|spread|runs?\b)/i);
+  if (m) return parseFloat(m[1]);
+
+  // "run line -3.5" / "spread -3.5"
+  m = question.match(/(?:run\s*line|puck\s*line|spread)\s+([+-]?\d+(?:\.\d+)?)/i);
+  if (m) return parseFloat(m[1]);
+
+  return null;
+}
+
+// Find the best-matching spread event for a single team name.
+// Used when the question names only one side (e.g. "Will the Pirates cover -3.5?").
+function findSpreadEventForTeam(teamName, spreadsEvents) {
+  let bestEvent = null;
+  let bestScore  = MIN_MATCH_SCORE - 0.001;
+
+  for (const event of spreadsEvents) {
+    const homeScore = teamMatchScore(teamName, event.home_team ?? '');
+    const awayScore = teamMatchScore(teamName, event.away_team ?? '');
+    const score = Math.max(homeScore, awayScore);
+
+    if (score >= MIN_MATCH_SCORE && score > bestScore) {
+      bestScore = score;
+      bestEvent = event;
+    }
+  }
+
+  return bestEvent;
+}
+
+// Compute the devigged spread probability for the named team in a specific event.
+// Picks the spread outcome whose point value is closest to targetSpread (within ±0.6).
+// Weights sharp books 2× like getH2HProbForTeam.
+function getSpreadProbForTeam(event, teamName, targetSpread, deviGMethod = 'multiplicative') {
+  const SPREAD_TOLERANCE = 0.6;
+  const spreadKeys = ['spreads', 'alternate_spreads'];
+  const samples = [];
+
+  for (const book of event.bookmakers ?? []) {
+    for (const market of book.markets ?? []) {
+      if (!spreadKeys.includes(market.key)) continue;
+
+      const outcomes = market.outcomes ?? [];
+      if (outcomes.length < 2) continue;
+
+      // Find the best-matching team outcome
+      let teamIdx = -1;
+      let bestNameScore = MIN_MATCH_SCORE - 0.001;
+      for (let i = 0; i < outcomes.length; i++) {
+        const score = teamMatchScore(teamName, outcomes[i].name);
+        if (score > bestNameScore) { bestNameScore = score; teamIdx = i; }
+      }
+      if (teamIdx === -1) continue;
+
+      const teamPoint = outcomes[teamIdx].point ?? 0;
+
+      // If a target spread was found, require it to be within tolerance
+      if (targetSpread !== null && Math.abs(teamPoint - targetSpread) > SPREAD_TOLERANCE) continue;
+
+      const impliedProbs = outcomes.map(o => americanToImplied(o.price));
+      const total = impliedProbs.reduce((s, p) => s + p, 0);
+      if (total <= 0) continue;
+
+      let prob;
+      if (deviGMethod === 'additive') {
+        const vigPerSide = (total - 1) / outcomes.length;
+        const adjusted   = impliedProbs.map(p => Math.max(0, p - vigPerSide));
+        const adjSum     = adjusted.reduce((s, p) => s + p, 0);
+        prob = adjSum > 0 ? adjusted[teamIdx] / adjSum : impliedProbs[teamIdx] / total;
+      } else {
+        prob = impliedProbs[teamIdx] / total;
+      }
+
+      samples.push({ prob, bookKey: book.key ?? '', bookTitle: book.title ?? '', point: teamPoint });
+    }
+  }
+
+  if (!samples.length) return null;
+
+  let wSum = 0, wTotal = 0;
+  for (const { prob, bookKey } of samples) {
+    const w = SHARP_BOOK_KEYS.has(bookKey) ? 2.0 : 1.0;
+    wSum   += prob * w;
+    wTotal += w;
+  }
+
+  // Best odds: first spread market, team's outcome price
+  const firstSpreadMkt = event.bookmakers
+    ?.flatMap(b => b.markets ?? [])
+    .find(m => spreadKeys.includes(m.key));
+  const matchedOdds = firstSpreadMkt?.outcomes?.find(o =>
+    teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE
+  )?.price ?? 0;
+
+  const sharpSample = samples.find(s => SHARP_BOOK_KEYS.has(s.bookKey));
+
+  return {
+    trueProb:     wSum / wTotal,
+    totalBooks:   samples.length,
+    bestBook:     sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
+    bestOdds:     matchedOdds,
+    matchedPoint: samples[0]?.point ?? null,
+  };
+}
+
 // Returns true for questions where YES = the named team DOES NOT do the positive thing.
 // Used to flip the sportsbook probability so YES EV is computed against the correct side.
 // e.g. "Will the Lakers miss the playoffs?" → YES = Lakers miss → flip sportsbook make-playoffs prob.
@@ -724,10 +926,18 @@ function isGameQuestion(question) {
 // This stops "Spurs win NBA title" from matching the Spurs' next-game h2h price.
 function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', deviGMethod = 'multiplicative') {
   const isChampionship = isChampionshipQuestion(question);
-  const isGame         = !isChampionship && isGameQuestion(question);
+  const isSpread       = !isChampionship && isSpreadQuestion(question);
+  const isTotals       = !isChampionship && !isSpread && isTotalsQuestion(question);
+  const isGame         = !isChampionship && !isSpread && !isTotals && isGameQuestion(question);
 
-  // Strict market-type keys — game questions ONLY see h2h, everything else ONLY sees outrights
-  const allowedKeys = isGame ? ['h2h'] : ['outrights'];
+  // Strict market-type routing: spread → spreads, totals → totals, game → h2h, else → outrights
+  const allowedKeys = isSpread
+    ? ['spreads', 'alternate_spreads']
+    : isTotals
+    ? ['totals', 'alternate_totals']
+    : isGame
+    ? ['h2h']
+    : ['outrights'];
 
   const sportHint = sportKeyFromTags(marketTags) || sportKeyFromQuestion(question);
   const topicHint = isChampionship ? extractEventTopic(question) : null;
