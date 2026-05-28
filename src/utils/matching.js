@@ -510,6 +510,9 @@ const NON_SPORTS_KEYWORDS = [
   // Sports-adjacent non-bettable (no sportsbook equivalent)
   'head coach of', 'fired as coach', 'hired as coach',
   'trade deadline', 'drafted by', 'sign with the',
+  // LIV Golf / player movement (no sportsbook market to cross-reference)
+  'join liv', 'joins liv', 'liv golf', 'defect to liv', 'move to liv',
+  'sign with liv', 'return to pga', 'suspended by pga', 'pga tour ban',
 ];
 
 export function isSportsMarket(question) {
@@ -543,7 +546,7 @@ export function extractTeamFromQuestion(question) {
     // "Super Bowl winner: Kansas City Chiefs?" — team after colon
     /(?:championship|cup|title|trophy|super bowl|world series|nba finals|wimbledon|masters|open|winner|champion)[^:]*:\s*(?:the )?(.+?)(?:\?|$)/i,
     // "Will [Player] win [Tournament]" already covered, but add "earn/take/grab/lead"
-    /will (?:the )?(.+?) (?:earn|take|grab|secure|sweep|go|lead|host)/i,
+    /will (?:the )?(.+?) \b(?:earn|take|grab|secure|sweep|lead|host)\b/i,
     // "[Team] to miss/fail/not make playoffs" — negative phrasing team extraction
     /(?:^|[^a-z])(?:the )?(.+?) (?:to miss|to fail|to not make)/i,
     // "Can [A] beat/defeat/win against [B]?"

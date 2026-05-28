@@ -109,7 +109,7 @@ export default function MarketCard({ opp }) {
               </p>
             ) : (
               opp.bookBreakdown.map(entry => {
-                const url = getSportsbookUrl(entry.bookKey);
+                const url = getSportsbookUrl(entry.bookKey, opp.sport);
                 const isBest = entry.bookTitle === opp.bestBook;
                 const favorable = entry.americanOdds > mktAmerican;
 
@@ -267,13 +267,49 @@ function formatDate(iso) {
   }
 }
 
-function getSportsbookUrl(bookKey) {
+function getSportsbookUrl(bookKey, sport = '') {
+  const s = (sport ?? '').toUpperCase();
+  const isNFL    = s === 'NFL';
+  const isNBA    = s === 'NBA';
+  const isNHL    = s === 'NHL';
+  const isMLB    = s === 'MLB';
+  const isNCAAF  = s === 'NCAAF';
+  const isNCAAB  = s === 'NCAAB';
+  const isGolf   = s === 'GOLF';
+  const isMMA    = s === 'UFC/MMA';
+  const isSoccer = s === 'SOCCER';
+  const isTennis = s === 'TENNIS';
+
   switch (bookKey) {
     case 'betonlineag':       return 'https://www.betonline.ag/sportsbook';
     case 'bovada_us':
     case 'bovada':            return 'https://www.bovada.lv/sports';
-    case 'draftkings':        return 'https://sportsbook.draftkings.com/';
-    case 'fanduel':           return 'https://sportsbook.fanduel.com/';
+    case 'draftkings': {
+      if (isNFL)    return 'https://sportsbook.draftkings.com/leagues/football/nfl';
+      if (isNBA)    return 'https://sportsbook.draftkings.com/leagues/basketball/nba';
+      if (isNHL)    return 'https://sportsbook.draftkings.com/leagues/hockey/nhl';
+      if (isMLB)    return 'https://sportsbook.draftkings.com/leagues/baseball/mlb';
+      if (isNCAAF)  return 'https://sportsbook.draftkings.com/leagues/football/ncaaf';
+      if (isNCAAB)  return 'https://sportsbook.draftkings.com/leagues/basketball/ncaab';
+      if (isGolf)   return 'https://sportsbook.draftkings.com/leagues/golf/pga-tour';
+      if (isMMA)    return 'https://sportsbook.draftkings.com/leagues/mma/ufc';
+      if (isSoccer) return 'https://sportsbook.draftkings.com/leagues/soccer/mls';
+      if (isTennis) return 'https://sportsbook.draftkings.com/leagues/tennis/atp-singles';
+      return 'https://sportsbook.draftkings.com/';
+    }
+    case 'fanduel': {
+      if (isNFL)    return 'https://sportsbook.fanduel.com/navigation/nfl';
+      if (isNBA)    return 'https://sportsbook.fanduel.com/navigation/nba';
+      if (isNHL)    return 'https://sportsbook.fanduel.com/navigation/nhl';
+      if (isMLB)    return 'https://sportsbook.fanduel.com/navigation/mlb';
+      if (isNCAAF)  return 'https://sportsbook.fanduel.com/navigation/college-football';
+      if (isNCAAB)  return 'https://sportsbook.fanduel.com/navigation/college-basketball';
+      if (isGolf)   return 'https://sportsbook.fanduel.com/navigation/golf';
+      if (isMMA)    return 'https://sportsbook.fanduel.com/navigation/mma';
+      if (isSoccer) return 'https://sportsbook.fanduel.com/navigation/soccer';
+      if (isTennis) return 'https://sportsbook.fanduel.com/navigation/tennis';
+      return 'https://sportsbook.fanduel.com/';
+    }
     case 'betmgm':            return 'https://sports.betmgm.com/en/sports';
     case 'caesars':
     case 'williamhill_us':    return 'https://www.caesars.com/sportsbook-and-casino';

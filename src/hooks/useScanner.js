@@ -160,9 +160,10 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
     binaryNoOddsMatch:0,
     multiChecked:     0,
     multiNoOddsMatch: 0,
-    filteredLiquidity:0,
-    filteredEv:       0,
-    skippedNonSports: 0,
+    filteredLiquidity:   0,
+    filteredEv:          0,
+    skippedNonSports:    0,
+    skippedUnsupported:  0,
   };
 
   for (let idx = 0; idx < polyMarkets.length; idx++) {
@@ -177,6 +178,12 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
     // Skip political, financial, entertainment markets
     if (!isSportsMarket(market.question)) {
       stats.skippedNonSports++;
+      continue;
+    }
+
+    // Skip market types with no sportsbook equivalent (top-N finish, set betting, etc.)
+    if (isUnsupportedMarketType(market.question)) {
+      stats.skippedUnsupported++;
       continue;
     }
 
@@ -303,6 +310,18 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             console.debug(`[Scanner] No team extracted: "${market.question}"`);
           continue;
         }
+
+        // Guard: if the extracted "team" is a placement/qualifier phrase, it's a
+        // bad extraction from a pattern like "Will [Player] finish top 5…" where
+        // we'd erroneously match "Player" against a winner outright.
+        const EXTRACTION_GARBAGE_WORDS = [
+          'top', 'finish', 'make the', 'qualify', 'advance to',
+          'round', 'set ', 'game ', 'tiebreak', 'podium',
+        ];
+        if (EXTRACTION_GARBAGE_WORDS.some(w => teamName.toLowerCase().includes(w))) {
+          stats.binaryNoQuestion++;
+          continue;
+        }
         const match = findBestOddsMatch(teamName, oddsEvents, market.tags, market.question, deviGMethod);
         if (!match) {
           stats.binaryNoOddsMatch++;
@@ -321,6 +340,16 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 
       if (trueProb === undefined) {
         stats.binaryNoOddsMatch++;
+        continue;
+      }
+
+      // Sanity check: if sportsbook consensus diverges from Polymarket by >60pp,
+      // the event match is almost certainly wrong (stale line, different event, etc.)
+      if (Math.abs(trueProb - yesPrice) > 0.60) {
+        stats.binaryNoOddsMatch++;
+        console.debug(
+          `[Scanner] 60pp delta skip: "${market.question}" poly=${yesPrice.toFixed(2)} books=${trueProb.toFixed(2)}`
+        );
         continue;
       }
 
@@ -754,14 +783,16 @@ function getH2HProbForTeam(event, teamName, deviGMethod = 'multiplicative') {
     wTotal += w;
   }
 
-  const sharpSample = samples.find(s => SHARP_BOOK_KEYS.has(s.bookKey));
-  const firstH2H    = event.bookmakers?.[0]?.markets?.find(m => m.key === 'h2h');
-  const matchedOdds = firstH2H?.outcomes?.find(o => teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE)?.price ?? 0;
+  const sharpSample  = samples.find(s => SHARP_BOOK_KEYS.has(s.bookKey));
+  const bestSampleH  = sharpSample ?? samples[0];
+  const bestBookEntry = event.bookmakers?.find(b => b.key === bestSampleH?.bookKey);
+  const bestH2H      = bestBookEntry?.markets?.find(m => m.key === 'h2h');
+  const matchedOdds  = bestH2H?.outcomes?.find(o => teamMatchScore(teamName, o.name) >= MIN_MATCH_SCORE)?.price ?? 0;
 
   return {
     trueProb:      wSum / wTotal,
     totalBooks:    samples.length,
-    bestBook:      sharpSample?.bookTitle ?? samples[0]?.bookTitle ?? '',
+    bestBook:      bestSampleH?.bookTitle ?? '',
     bestOdds:      matchedOdds,
     bookBreakdown: collectBookBreakdown(event, teamName, ['h2h']),
   };
@@ -782,6 +813,11 @@ const CHAMPIONSHIP_KEYWORDS = [
   'masters', 'us open', 'british open', 'the open championship',
   'pga championship', 'wimbledon', 'french open', 'australian open',
   'grand slam', 'daytona 500', 'indy 500', 'monaco grand prix',
+  // PGA Tour named events
+  'genesis invitational', 'players championship', 'memorial tournament',
+  'charles schwab challenge', 'rbc heritage', 'travelers championship',
+  'john deere classic', 'rocket mortgage classic', 'wyndham championship',
+  'bmw championship', 'fedex cup', 'tour championship',
   // Award / season-long markets
   'season mvp', 'league mvp', 'mvp award', 'cy young', 'heisman',
   'ballon d\'or', 'rookie of the year',
@@ -813,7 +849,11 @@ function sportKeyFromQuestion(question) {
   if (q.includes('world series') || q.includes(' mlb ') || q.includes('baseball'))
     return 'baseball';
   if (q.includes(' pga ') || q.includes('lpga') || q.includes('golf') ||
-      q.includes('masters') || q.includes('british open') || q.includes('the open'))
+      q.includes('masters') || q.includes('british open') || q.includes('the open') ||
+      q.includes('players championship') || q.includes('memorial tournament') ||
+      q.includes('genesis invitational') || q.includes('charles schwab') ||
+      q.includes('travelers championship') || q.includes('fedex cup') ||
+      q.includes('tour championship') || q.includes('rbc heritage'))
     return 'golf';
   if (q.includes('wimbledon') || q.includes('french open') || q.includes('australian open') ||
       q.includes(' atp ') || q.includes(' wta ') || q.includes('tennis'))
@@ -897,6 +937,23 @@ function isSpreadQuestion(question) {
 function isTotalsQuestion(question) {
   const q = question.toLowerCase();
   return /\b(over|under)\s+\d/.test(q) || /\btotal\b.*\d/.test(q);
+}
+
+// Markets that have no direct sportsbook equivalent — skip entirely rather than
+// cross-matching against the wrong market (e.g. winner outrights for a top-5 finish).
+function isUnsupportedMarketType(question) {
+  const q = question.toLowerCase();
+  // Top-N finish (golf/racing placement markets)
+  if (/\btop[- ]?\d+\b/.test(q)) return true;
+  if (/\bfinish(?:es)?\s+(?:in\s+)?(?:the\s+)?top\s+\d+\b/.test(q)) return true;
+  // Set-N winner / tennis set betting
+  if (/\b(?:win|wins|winner of)\s+(?:the\s+)?(?:first|second|third|1st|2nd|3rd|\d+(?:st|nd|rd|th)?\s+)?set\b/.test(q)) return true;
+  if (/\bset\s+\d+\s+(?:winner|handicap|line|spread)\b/.test(q)) return true;
+  // Tiebreak / supertiebreak
+  if (/\btiebreak\b/.test(q) || /\bsuper[- ]?tiebreak\b/.test(q)) return true;
+  // Individual game winner within a series (not "win the series" or "win the game")
+  if (/\bgame\s+[1-7]\s+winner\b/.test(q)) return true;
+  return false;
 }
 
 // Extract the numeric point spread from a Polymarket question.
