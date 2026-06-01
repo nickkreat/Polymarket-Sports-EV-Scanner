@@ -5,6 +5,16 @@ import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
 import { extractTeamFromQuestion, canonicalTeamName, teamMatchScore, isSportsMarket, isOverUnderOutcomes, isOverUnderOutcome } from '../utils/matching';
 import { classifyPolymarketMarket } from '../utils/marketClassification';
+import {
+  CLAUDE_FALLBACK_THRESHOLD,
+  clearClaudeMatchCache,
+  collectUniqueOutcomeNames,
+  createClaudeMatchStats,
+  claudeMatchOutcome,
+  claudeMatchH2HEvent,
+  claudeExtractTeam,
+  DEFAULT_CLAUDE_MODEL,
+} from '../services/claudeMatcher';
 
 const MIN_MATCH_SCORE = 0.66;
 
@@ -72,7 +82,8 @@ export function useScanner(settings) {
       }
 
       setStatus('scanning — computing EV…');
-      const { results, stats } = await buildOpportunities(polyMarkets, oddsEvents, settings);
+      clearClaudeMatchCache();
+      const { results, stats } = await buildOpportunities(polyMarkets, oddsEvents, { ...settings, _abortSignal: controller.signal });
       console.debug('[Scanner] Match stats:', stats);
       console.debug(`[Scanner] Found ${results.length} opportunities`);
 
@@ -96,6 +107,9 @@ export function useScanner(settings) {
         multiNoOddsMatch:         stats.multiNoOddsMatch,
         filteredByLiquidity:      stats.filteredLiquidity,
         filteredByEv:             stats.filteredEv,
+        claudeCalls:              stats.claudeCalls,
+        claudeCacheHits:          stats.claudeCacheHits,
+        claudeMatches:            stats.claudeMatches,
         matchedMarkets:           results.length,
         positiveEv:               results.filter(r => r.evPct > 0).length,
       });
@@ -138,6 +152,15 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
   const maxKellyPct = (settings.maxKellyPct ?? 25) / 100;
   const deviGMethod = settings.deviGMethod ?? 'multiplicative';
 
+  const claudeStats = createClaudeMatchStats();
+  const matchCtx = {
+    claudeEnabled: Boolean(settings.enableClaudeMatcher !== false && settings.claudeApiKey),
+    apiKey:        settings.claudeApiKey ?? '',
+    model:         settings.claudeModel || DEFAULT_CLAUDE_MODEL,
+    stats:         claudeStats,
+    signal:        settings._abortSignal ?? null,
+  };
+
   // Per-step diagnostic counters
   const stats = {
     binaryChecked:    0,
@@ -149,6 +172,9 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
     filteredEv:          0,
     skippedNonSports:    0,
     skippedUnsupported:  0,
+    claudeCalls:         0,
+    claudeCacheHits:     0,
+    claudeMatches:       0,
   };
 
   for (let idx = 0; idx < polyMarkets.length; idx++) {
@@ -231,7 +257,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         // Try dual-team parse for accurate event matching
         const parsed = parseGameQuestion(market.question, sportHint);
         if (parsed) {
-          spreadEvt  = findH2HEvent(parsed.teamA, parsed.teamB, spreadsPool, market.endDate, sportHint);
+          spreadEvt  = await findH2HEvent(parsed.teamA, parsed.teamB, spreadsPool, market.endDate, sportHint, matchCtx, market.question);
           spreadTeam = parsed.teamA;
         }
 
@@ -291,7 +317,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         const parsed = parseGameQuestion(market.question, sportHint)
           ?? (market.eventTitle ? parseGameQuestion(market.eventTitle, sportHint) : null);
         if (parsed) {
-          totalsEvt  = findH2HEvent(parsed.teamA, parsed.teamB, totalsPool, market.endDate, sportHint);
+          totalsEvt  = await findH2HEvent(parsed.teamA, parsed.teamB, totalsPool, market.endDate, sportHint, matchCtx, market.question);
           totalsSide = inferTotalsSide(market.question, outcomes, yesIdx >= 0 ? yesIdx : 0);
         }
 
@@ -336,7 +362,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           const h2hPool = oddsEvents.filter(e =>
             e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
           );
-          const h2hEvt = findH2HEvent(parsed.teamA, parsed.teamB, h2hPool, market.endDate, sportHint);
+          const h2hEvt = await findH2HEvent(parsed.teamA, parsed.teamB, h2hPool, market.endDate, sportHint, matchCtx, market.question);
           if (h2hEvt) {
             const p = getH2HProbForTeam(h2hEvt, parsed.teamA, deviGMethod);
             if (p) {
@@ -360,7 +386,27 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 
       // ── Path B: single-team fallback (futures, championships, unmatched games) ──
       if (trueProb === undefined) {
-        const teamName = extractTeamFromQuestion(market.question);
+        let teamName = extractTeamFromQuestion(market.question);
+        if (!teamName && matchCtx.claudeEnabled) {
+          const pool = oddsEvents.filter(e =>
+            e.bookmakers?.some(b => b.markets?.some(m => m.key === 'outrights' || m.key === 'h2h'))
+          );
+          const candidates = collectUniqueOutcomeNames(pool, ['outrights', 'h2h']);
+          const extracted = await claudeExtractTeam({
+            apiKey:     matchCtx.apiKey,
+            model:      matchCtx.model,
+            question:   market.question,
+            eventTitle: market.eventTitle ?? '',
+            sportHint:  sportHint ?? '',
+            candidates,
+            signal:     matchCtx.signal,
+            stats:      matchCtx.stats,
+          });
+          if (extracted?.team) {
+            teamName = canonicalTeamName(extracted.team, { sportHint });
+            console.debug(`[Claude-Extract] "${market.question}" → "${teamName}" conf=${extracted.confidence.toFixed(2)}`);
+          }
+        }
         if (!teamName) {
           stats.binaryNoQuestion++;
           if (stats.binaryNoQuestion <= 10)
@@ -379,7 +425,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           stats.binaryNoQuestion++;
           continue;
         }
-        const match = findBestOddsMatch(teamName, oddsEvents, market.tags, market.question, deviGMethod, market.eventTitle, typeRoute);
+        const match = await findBestOddsMatch(teamName, oddsEvents, market.tags, market.question, deviGMethod, market.eventTitle, typeRoute, matchCtx);
         if (!match) {
           stats.binaryNoOddsMatch++;
           console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamName}"`);
@@ -500,7 +546,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             m.key === 'spreads' || m.key === 'alternate_spreads'
           ))
         );
-        const spreadEvt = findH2HEvent(teamA, teamB, spreadsPool, market.endDate, sportHint);
+        const spreadEvt = await findH2HEvent(teamA, teamB, spreadsPool, market.endDate, sportHint, matchCtx, market.question);
 
         if (!spreadEvt) {
           stats.multiNoOddsMatch++;
@@ -598,7 +644,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         const totalsPool = oddsEvents.filter(e =>
           e.bookmakers?.some(b => b.markets?.some(m => m.key === 'totals' || m.key === 'alternate_totals'))
         );
-        const totalsEvt = findH2HEvent(parsed.teamA, parsed.teamB, totalsPool, market.endDate, sportHint);
+        const totalsEvt = await findH2HEvent(parsed.teamA, parsed.teamB, totalsPool, market.endDate, sportHint, matchCtx, market.question);
         if (!totalsEvt) {
           stats.multiNoOddsMatch++;
           console.debug(`[Scanner] No totals event: "${market.question}" → ${parsed.teamA} vs ${parsed.teamB}`);
@@ -689,7 +735,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         const h2hPool = oddsEvents.filter(e =>
           e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
         );
-        const h2hEvt = findH2HEvent(teamA, teamB, h2hPool, market.endDate, sportHint);
+        const h2hEvt = await findH2HEvent(teamA, teamB, h2hPool, market.endDate, sportHint, matchCtx, market.question);
 
         if (h2hEvt) {
           const pA = getH2HProbForTeam(h2hEvt, teamA, deviGMethod);
@@ -771,7 +817,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
           if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
 
-          const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question, deviGMethod, market.eventTitle, typeRoute);
+          const match = await findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question, deviGMethod, market.eventTitle, typeRoute, matchCtx);
           if (!match) {
             stats.multiNoOddsMatch++;
             continue;
@@ -825,6 +871,10 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
     }
   }
 
+  stats.claudeCalls     = claudeStats.calls;
+  stats.claudeCacheHits = claudeStats.cacheHits;
+  stats.claudeMatches   = claudeStats.matches;
+
   results.sort((a, b) => b.evPct - a.evPct);
   return { results, stats };
 }
@@ -871,10 +921,7 @@ function parseGameQuestion(question, sportHint = null) {
 }
 
 // Find the H2H event where BOTH teams match (one each side of home/away).
-// This prevents "Thunder vs Suns" matching when the question is "Thunder vs Wolves".
-// endDate: the Polymarket market's endDate — used to prefer events whose commence_time
-// is within 3 days, so series games (Mon/Tue/Wed) match the correct game date.
-function findH2HEvent(teamA, teamB, h2hEvents, endDate = null, sportHint = null) {
+function findH2HEventSync(teamA, teamB, h2hEvents, endDate = null, sportHint = null) {
   let bestEvent     = null;
   let bestTeamScore = MIN_MATCH_SCORE - 0.001;
   let bestDateDiff  = Infinity;
@@ -888,19 +935,16 @@ function findH2HEvent(teamA, teamB, h2hEvents, endDate = null, sportHint = null)
     const homeB = teamMatchScore(teamB, event.home_team ?? '', matchOpts);
     const awayB = teamMatchScore(teamB, event.away_team ?? '', matchOpts);
 
-    // A=home & B=away, or A=away & B=home — take the better combination
     const teamScore = Math.max(Math.min(homeA, awayB), Math.min(awayA, homeB));
     if (teamScore < MIN_MATCH_SCORE) continue;
 
-    // Date-proximity: skip events more than 3 days from the Polymarket endDate.
-    // Among events meeting the team threshold, prefer the one closest to endDate.
     let dateDiff = 0;
     if (!isNaN(endMs) && event.commence_time) {
       dateDiff = Math.abs(Date.parse(event.commence_time) - endMs) / 86400000;
       if (dateDiff > 3) continue;
     }
 
-    const betterTeam        = teamScore > bestTeamScore;
+    const betterTeam         = teamScore > bestTeamScore;
     const sameTeamCloserDate = teamScore === bestTeamScore && dateDiff < bestDateDiff;
     if (betterTeam || sameTeamCloserDate) {
       bestTeamScore = teamScore;
@@ -909,7 +953,42 @@ function findH2HEvent(teamA, teamB, h2hEvents, endDate = null, sportHint = null)
     }
   }
 
-  return bestEvent;
+  return { event: bestEvent, teamScore: bestTeamScore };
+}
+
+async function findH2HEvent(teamA, teamB, h2hEvents, endDate = null, sportHint = null, matchCtx = null, question = '') {
+  const { event, teamScore } = findH2HEventSync(teamA, teamB, h2hEvents, endDate, sportHint);
+  if (event && teamScore >= CLAUDE_FALLBACK_THRESHOLD) return event;
+  if (event && !matchCtx?.claudeEnabled) return event;
+
+  if (matchCtx?.claudeEnabled && h2hEvents.length > 0) {
+    try {
+      const pool = h2hEvents.slice(0, 80);
+      const claudeResult = await claudeMatchH2HEvent({
+        apiKey:   matchCtx.apiKey,
+        model:    matchCtx.model,
+        question: question || `${teamA} vs ${teamB}`,
+        teamA,
+        teamB,
+        events:   pool.slice(0, 80),
+        endDate,
+        signal:   matchCtx.signal,
+        stats:    matchCtx.stats,
+      });
+      if (claudeResult?.event) {
+        console.debug(
+          `[Claude-H2H] "${question || `${teamA} vs ${teamB}`}" →` +
+          ` ${claudeResult.event.away_team} @ ${claudeResult.event.home_team}` +
+          ` conf=${claudeResult.confidence.toFixed(2)}`
+        );
+        return claudeResult.event;
+      }
+    } catch (err) {
+      console.warn('[Claude-H2H] fallback failed:', err.message);
+    }
+  }
+
+  return event;
 }
 
 // Sharp books give more reliable consensus lines; weight them 2× vs recreational books.
@@ -1536,13 +1615,12 @@ function isGameQuestion(question) {
 //   game question          → h2h only        (never championship futures)
 //   season-long / unclear  → outrights only  (safer: futures vs futures)
 // This stops "Spurs win NBA title" from matching the Spurs' next-game h2h price.
-function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', deviGMethod = 'multiplicative', eventTitle = '', typeRoute = null) {
+async function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', deviGMethod = 'multiplicative', eventTitle = '', typeRoute = null, matchCtx = null) {
   const isChampionship = typeRoute?.isChampionship ?? isChampionshipQuestion(question, eventTitle);
   const isSpread       = typeRoute?.isSpread ?? (!isChampionship && isSpreadQuestion(question));
   const isTotals       = typeRoute?.isTotals ?? (!isChampionship && !isSpread && isTotalsQuestion(question));
   const isGame         = typeRoute?.isGame ?? (!isChampionship && !isSpread && !isTotals && isGameQuestion(question));
 
-  // Strict market-type routing: spread → spreads, totals → totals, game → h2h, else → outrights
   const allowedKeys = isSpread
     ? ['spreads', 'alternate_spreads']
     : isTotals
@@ -1554,7 +1632,6 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', dev
   const sportHint = sportKeyFromTags(marketTags) || sportKeyFromQuestion(question);
   const topicHint = isChampionship ? extractEventTopic(question, eventTitle) : null;
 
-  // Pre-filter event pool to only events that actually contain the right market type.
   const typePool = oddsEvents.filter(e =>
     e.bookmakers?.some(b => b.markets?.some(m => allowedKeys.includes(m.key)))
   );
@@ -1566,23 +1643,18 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', dev
     if (scoped.length > 0) {
       candidates = scoped;
     } else if (sportHint.includes('_')) {
-      // Broaden: 'americanfootball_nfl' → try 'americanfootball' (catches ncaaf, etc.)
       const broadHint = sportHint.split('_')[0];
       const broadScoped = typePool.filter(e => e.sport_key?.toLowerCase().includes(broadHint));
       if (broadScoped.length > 0) {
         candidates = broadScoped;
       } else if (!isGame) {
-        return null; // Known sport, zero events → skip (avoids cross-sport false match)
+        return null;
       }
     } else if (!isGame) {
       return null;
     }
-    // Game questions with no sport match fall through to full typePool — better than no match.
   }
 
-  // For championship questions, narrow further to events whose home_team
-  // (= competition title in The Odds API's outright format) matches the topic.
-  // e.g. "Stanley Cup" → only "Stanley Cup Champion" events, not "Eastern Conference".
   if (topicHint) {
     const topicScoped = candidates.filter(e => {
       const title = ((e.home_team ?? '') + ' ' + (e.away_team ?? '')).toLowerCase();
@@ -1591,16 +1663,19 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', dev
     if (topicScoped.length > 0) {
       candidates = topicScoped;
     } else {
-      // Tournament not present in the API (completed or too far out) — no valid match.
-      // Do NOT fall back to the broader pool; that would match a different tournament.
       return null;
     }
   }
 
-  return searchEvents(name, candidates, allowedKeys, deviGMethod);
+  return searchEvents(name, candidates, allowedKeys, deviGMethod, {
+    question,
+    matchCtx,
+    marketContext: isGame ? 'game h2h' : isSpread ? 'spread' : isTotals ? 'total' : 'outright/futures',
+  });
 }
 
-function searchEvents(name, events, allowedKeys = ['outrights', 'h2h'], deviGMethod = 'multiplicative') {
+async function searchEvents(name, events, allowedKeys = ['outrights', 'h2h'], deviGMethod = 'multiplicative', options = {}) {
+  const { question = '', matchCtx = null, marketContext = '', skipClaude = false } = options;
   let bestScore = MIN_MATCH_SCORE - 0.001;
   let bestData  = null;
 
@@ -1632,9 +1707,47 @@ function searchEvents(name, events, allowedKeys = ['outrights', 'h2h'], deviGMet
             matchMarketType: market.key,
             event,
             bookBreakdown:   collectBookBreakdown(event, outcome.name, allowedKeys),
+            claudeMatched:   false,
           };
         }
       }
+    }
+  }
+
+  const needsClaude = matchCtx?.claudeEnabled && !skipClaude &&
+    (!bestData || bestScore < CLAUDE_FALLBACK_THRESHOLD);
+
+  if (needsClaude) {
+    try {
+      const candidateNames = collectUniqueOutcomeNames(events, allowedKeys);
+      const claudeResult = await claudeMatchOutcome({
+        apiKey:        matchCtx.apiKey,
+        model:         matchCtx.model,
+        question:      question || name,
+        entityHint:    name,
+        candidates:    candidateNames,
+        marketContext,
+        signal:        matchCtx.signal,
+        stats:         matchCtx.stats,
+      });
+
+      if (claudeResult?.match) {
+        const claudeData = await searchEvents(claudeResult.match, events, allowedKeys, deviGMethod, {
+          question,
+          matchCtx,
+          marketContext,
+          skipClaude: true,
+        });
+        if (claudeData) {
+          console.debug(
+            `[Claude-Outcome] "${name}" → "${claudeData.matchedOutcome}"` +
+            ` conf=${claudeResult.confidence.toFixed(2)} score=${claudeData.matchScore.toFixed(2)}`
+          );
+          return { ...claudeData, claudeMatched: true, claudeConfidence: claudeResult.confidence };
+        }
+      }
+    } catch (err) {
+      console.warn('[Claude-Outcome] fallback failed:', err.message);
     }
   }
 

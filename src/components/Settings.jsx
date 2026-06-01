@@ -12,6 +12,7 @@ const KELLY_PRESETS = [
 export default function Settings({ settings, onUpdate, onClose, onReset }) {
   const [showKey, setShowKey] = useState(false);
   const [showPapiKey, setShowPapiKey] = useState(false);
+  const [showClaudeKey, setShowClaudeKey] = useState(false);
   const [customKelly, setCustomKelly] = useState(false);
   const [probeState, setProbeState] = useState(null);
   const [probing, setProbing] = useState(false);
@@ -108,6 +109,36 @@ export default function Settings({ settings, onUpdate, onClose, onReset }) {
                   checked={settings.enableDraftKingsGolfFallback !== false}
                   onChange={v => update('enableDraftKingsGolfFallback', v)}
                   label="Try DraftKings golf fallback in browser (best-effort)"
+                />
+              </div>
+            </Field>
+
+            <Field label="Claude API Key (matching fallback)" hint={<a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer" className="text-green-400 hover:underline flex items-center gap-0.5">Get key at console.anthropic.com <ExternalLink className="w-3 h-3" /></a>}>
+              <div className="relative">
+                <input
+                  type={showClaudeKey ? 'text' : 'password'}
+                  value={settings.claudeApiKey ?? ''}
+                  onChange={e => update('claudeApiKey', e.target.value)}
+                  placeholder="Optional — improves hard team/player matches via Haiku"
+                  className="input pr-9"
+                  autoComplete="off"
+                />
+                <button
+                  onClick={() => setShowClaudeKey(v => !v)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+                  type="button"
+                >
+                  {showClaudeKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <p className="text-xs text-zinc-600 mt-1">
+                Used only when alias matching scores below 70%. Cached per scan — typically a few cents per run on Haiku.
+              </p>
+              <div className="mt-2">
+                <Toggle
+                  checked={settings.enableClaudeMatcher !== false}
+                  onChange={v => update('enableClaudeMatcher', v)}
+                  label="Enable Claude fallback matcher when key is set"
                 />
               </div>
             </Field>

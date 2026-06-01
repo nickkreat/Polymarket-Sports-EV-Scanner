@@ -481,6 +481,7 @@ function tokenOverlapScore(a, b) {
 
 // Score how well two team/player names match (0–1)
 // Cached — the same (a,b) pair is checked across many bookmakers/markets.
+// When score < 0.7, useScanner may call Claude API fallback (see claudeMatcher.js).
 export function teamMatchScore(a, b, { sportHint } = {}) {
   // Symmetric key
   const key = a <= b ? `${a}|||${b}` : `${b}|||${a}`;
