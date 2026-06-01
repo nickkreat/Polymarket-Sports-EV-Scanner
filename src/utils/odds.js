@@ -3,6 +3,12 @@ export function americanToDecimal(american) {
   return 100 / Math.abs(american) + 1;
 }
 
+export function decimalToAmerican(decimal) {
+  const d = Number(decimal);
+  if (!d || d <= 1) return null;
+  return d >= 2 ? Math.round((d - 1) * 100) : Math.round(-100 / (d - 1));
+}
+
 export function decimalToImplied(decimal) {
   return 1 / decimal;
 }

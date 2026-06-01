@@ -4,6 +4,7 @@ import {
   AlertTriangle, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { impliedToAmerican } from '../utils/odds';
+import { getSportsbookMarketUrl, sportsbookLinkTitle } from '../utils/sportsbookLinks';
 
 export default function MarketCard({ opp }) {
   const [showBooks, setShowBooks] = useState(false);
@@ -109,7 +110,16 @@ export default function MarketCard({ opp }) {
               </p>
             ) : (
               opp.bookBreakdown.map(entry => {
-                const url = getSportsbookUrl(entry.bookKey, opp.sport);
+                const linkCtx = {
+                  ...(opp.bookLinkContext ?? {}),
+                  sport: opp.sport,
+                  marketType: opp.bookLinkContext?.marketType ?? opp.matchMarketType,
+                  point: opp.bookLinkContext?.point ?? opp.matchedLinePoint,
+                  side: opp.side,
+                  bookUrl: entry.bookUrl ?? null,
+                };
+                const url = getSportsbookMarketUrl(entry.bookKey, linkCtx);
+                const linkTitle = sportsbookLinkTitle(linkCtx);
                 const isBest = entry.bookTitle === opp.bestBook;
                 const favorable = entry.americanOdds > mktAmerican;
 
@@ -132,7 +142,7 @@ export default function MarketCard({ opp }) {
                     </span>
                     <span className="w-4 flex-shrink-0 flex justify-center">
                       {url ? (
-                        <a href={url} target="_blank" rel="noopener noreferrer" className="text-zinc-600 hover:text-blue-400 transition-colors">
+                        <a href={url} target="_blank" rel="noopener noreferrer" title={linkTitle} className="text-zinc-600 hover:text-blue-400 transition-colors">
                           <ExternalLink className="w-3 h-3" />
                         </a>
                       ) : (
@@ -264,69 +274,5 @@ function formatDate(iso) {
     return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
   } catch {
     return iso;
-  }
-}
-
-function getSportsbookUrl(bookKey, sport = '') {
-  const s = (sport ?? '').toUpperCase();
-  const isNFL    = s === 'NFL';
-  const isNBA    = s === 'NBA';
-  const isNHL    = s === 'NHL';
-  const isMLB    = s === 'MLB';
-  const isNCAAF  = s === 'NCAAF';
-  const isNCAAB  = s === 'NCAAB';
-  const isGolf   = s === 'GOLF';
-  const isMMA    = s === 'UFC/MMA';
-  const isSoccer = s === 'SOCCER';
-  const isTennis = s === 'TENNIS';
-
-  switch (bookKey) {
-    case 'betonlineag':       return 'https://www.betonline.ag/sportsbook';
-    case 'bovada_us':
-    case 'bovada':            return 'https://www.bovada.lv/sports';
-    case 'draftkings': {
-      if (isNFL)    return 'https://sportsbook.draftkings.com/leagues/football/nfl';
-      if (isNBA)    return 'https://sportsbook.draftkings.com/leagues/basketball/nba';
-      if (isNHL)    return 'https://sportsbook.draftkings.com/leagues/hockey/nhl';
-      if (isMLB)    return 'https://sportsbook.draftkings.com/leagues/baseball/mlb';
-      if (isNCAAF)  return 'https://sportsbook.draftkings.com/leagues/football/ncaaf';
-      if (isNCAAB)  return 'https://sportsbook.draftkings.com/leagues/basketball/ncaab';
-      if (isGolf)   return 'https://sportsbook.draftkings.com/leagues/golf/pga-tour';
-      if (isMMA)    return 'https://sportsbook.draftkings.com/leagues/mma/ufc';
-      if (isSoccer) return 'https://sportsbook.draftkings.com/leagues/soccer/mls';
-      if (isTennis) return 'https://sportsbook.draftkings.com/leagues/tennis/atp-singles';
-      return 'https://sportsbook.draftkings.com/';
-    }
-    case 'fanduel': {
-      if (isNFL)    return 'https://sportsbook.fanduel.com/navigation/nfl';
-      if (isNBA)    return 'https://sportsbook.fanduel.com/navigation/nba';
-      if (isNHL)    return 'https://sportsbook.fanduel.com/navigation/nhl';
-      if (isMLB)    return 'https://sportsbook.fanduel.com/navigation/mlb';
-      if (isNCAAF)  return 'https://sportsbook.fanduel.com/navigation/college-football';
-      if (isNCAAB)  return 'https://sportsbook.fanduel.com/navigation/college-basketball';
-      if (isGolf)   return 'https://sportsbook.fanduel.com/navigation/golf';
-      if (isMMA)    return 'https://sportsbook.fanduel.com/navigation/mma';
-      if (isSoccer) return 'https://sportsbook.fanduel.com/navigation/soccer';
-      if (isTennis) return 'https://sportsbook.fanduel.com/navigation/tennis';
-      return 'https://sportsbook.fanduel.com/';
-    }
-    case 'betmgm':            return 'https://sports.betmgm.com/en/sports';
-    case 'caesars':
-    case 'williamhill_us':    return 'https://www.caesars.com/sportsbook-and-casino';
-    case 'pinnacle':          return 'https://www.pinnacle.com/en/sport/matchups';
-    case 'betfair_ex_eu':     return 'https://www.betfair.com/exchange/plus/';
-    case 'lowvig':            return 'https://www.lowvig.ag/';
-    case 'mybookieag':        return 'https://mybookie.ag/sportsbook/';
-    case 'superbook':         return 'https://co.superbook.com/sports';
-    case 'unibet_us':         return 'https://www.unibet.com/betting/sports/';
-    case 'pointsbetus':       return 'https://www.pointsbet.com/sports';
-    case 'betrivers':         return 'https://www.betrivers.com/';
-    case 'barstool':          return 'https://www.barstoolsportsbook.com/';
-    case 'foxbet':            return 'https://www.foxbet.com/';
-    case 'twinspires':        return 'https://www.twinspires.com/sports/';
-    case 'wynnbet':           return 'https://www.wynnbet.com/sports/';
-    case 'circa':             return 'https://www.circasports.com/';
-    case 'bookmaker':         return 'https://www.bookmaker.eu/sportsbook/';
-    default:                  return null;
   }
 }

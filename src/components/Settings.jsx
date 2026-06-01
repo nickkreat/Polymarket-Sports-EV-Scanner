@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { X, Eye, EyeOff, RotateCcw, ExternalLink, HelpCircle } from 'lucide-react';
+import { X, Eye, EyeOff, RotateCcw, ExternalLink, HelpCircle, Loader2, Search } from 'lucide-react';
+import { probeGolfOddsSources } from '../services/oddsProviders';
 
 const KELLY_PRESETS = [
   { label: 'Full Kelly (1×)', value: 1 },
@@ -10,11 +11,30 @@ const KELLY_PRESETS = [
 
 export default function Settings({ settings, onUpdate, onClose, onReset }) {
   const [showKey, setShowKey] = useState(false);
+  const [showPapiKey, setShowPapiKey] = useState(false);
   const [customKelly, setCustomKelly] = useState(false);
+  const [probeState, setProbeState] = useState(null);
+  const [probing, setProbing] = useState(false);
 
   const update = (key, val) => onUpdate({ [key]: val });
 
   const isPreset = KELLY_PRESETS.some(p => p.value === settings.kellyFraction);
+
+  const runGolfProbe = async () => {
+    setProbing(true);
+    setProbeState(null);
+    try {
+      const result = await probeGolfOddsSources({
+        oddspApiKey: settings.oddspApiKey,
+        testDraftKings: settings.enableDraftKingsGolfFallback !== false,
+      });
+      setProbeState(result);
+    } catch (err) {
+      setProbeState({ error: err.message ?? String(err) });
+    } finally {
+      setProbing(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-end">
@@ -53,8 +73,93 @@ export default function Settings({ settings, onUpdate, onClose, onReset }) {
                   {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
-              <p className="text-xs text-zinc-600 mt-1">Stored only in your browser. Never sent anywhere except The Odds API.</p>
+              <p className="text-xs text-zinc-600 mt-1">Stored only in your browser. Used for NBA/NFL game lines and major golf futures.</p>
             </Field>
+
+            <Field label="OddsPapi Key (PGA Tour)" hint={<a href="https://oddspapi.io" target="_blank" rel="noopener noreferrer" className="text-green-400 hover:underline flex items-center gap-0.5">Free tier at oddspapi.io <ExternalLink className="w-3 h-3" /></a>}>
+              <div className="relative">
+                <input
+                  type={showPapiKey ? 'text' : 'password'}
+                  value={settings.oddspApiKey ?? ''}
+                  onChange={e => update('oddspApiKey', e.target.value)}
+                  placeholder="Optional — weekly PGA Tour outrights (Charles Schwab, etc.)"
+                  className="input pr-9"
+                  autoComplete="off"
+                />
+                <button
+                  onClick={() => setShowPapiKey(v => !v)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+                  type="button"
+                >
+                  {showPapiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <p className="text-xs text-zinc-600 mt-1">Supplements The Odds API for weekly PGA events not covered by the four majors.</p>
+            </Field>
+
+            <Field label="Supplemental golf sources">
+              <div className="space-y-2">
+                <Toggle
+                  checked={settings.enableOddsPapi !== false}
+                  onChange={v => update('enableOddsPapi', v)}
+                  label="Use OddsPapi for PGA Tour outrights when key is set"
+                />
+                <Toggle
+                  checked={settings.enableDraftKingsGolfFallback !== false}
+                  onChange={v => update('enableDraftKingsGolfFallback', v)}
+                  label="Try DraftKings golf fallback in browser (best-effort)"
+                />
+              </div>
+            </Field>
+
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={runGolfProbe}
+                disabled={probing}
+                className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg border border-[#27272a] bg-[#18181b] text-sm text-zinc-300 hover:border-zinc-600 hover:text-zinc-100 transition-colors disabled:opacity-50"
+              >
+                {probing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                Test Golf Odds Sources
+              </button>
+              {probeState && (
+                <div className="mt-2 p-3 rounded-lg bg-[#18181b] border border-[#27272a] text-xs space-y-2">
+                  {probeState.error ? (
+                    <p className="text-red-400">{probeState.error}</p>
+                  ) : (
+                    <>
+                      <ProbeLine
+                        label="OddsPapi"
+                        ok={probeState.oddspapi?.charlesSchwabFound || (probeState.oddspapi?.ok && !probeState.oddspapi?.error && !probeState.oddspapi?.schwabOddsError)}
+                        detail={
+                          probeState.oddspapi?.charlesSchwabFound
+                            ? `Charles Schwab odds OK (${probeState.oddspapi?.samplePlayers?.slice(0, 3).join(', ')}…)`
+                            : probeState.oddspapi?.schwabOddsError
+                            ?? probeState.oddspapi?.error
+                            ?? (probeState.oddspapi?.charlesSchwabListed
+                              ? 'Charles Schwab listed — waiting for odds'
+                              : `${probeState.oddspapi?.tournamentCount ?? 0} tournaments`) +
+                               (probeState.oddspapi?.bookmakersUsed ? ` via ${probeState.oddspapi.bookmakersUsed}` : '')
+                        }
+                      />
+                      <ProbeLine
+                        label="DraftKings fallback"
+                        ok={probeState.draftKings?.ok}
+                        detail={
+                          probeState.draftKings?.ok
+                            ? `${probeState.draftKings.playerCount ?? '?'} players`
+                            : probeState.draftKings?.error
+                            ?? 'Unavailable (browser CORS/geo — expected; OddsPapi is primary)'
+                        }
+                      />
+                      {probeState.recommendation && (
+                        <p className="text-zinc-400 pt-1 border-t border-[#27272a]">{probeState.recommendation}</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
           </Section>
 
           {/* Bankroll */}
@@ -302,5 +407,17 @@ function Tip({ text }) {
     <span title={text} className="cursor-help">
       <HelpCircle className="w-3.5 h-3.5 text-zinc-600 hover:text-zinc-400 transition-colors" />
     </span>
+  );
+}
+
+function ProbeLine({ label, ok, detail }) {
+  return (
+    <div className="flex items-start gap-2">
+      <span className={ok ? 'text-green-400' : 'text-yellow-500'}>{ok ? '✓' : '○'}</span>
+      <div>
+        <span className="text-zinc-300 font-medium">{label}: </span>
+        <span className="text-zinc-500">{detail}</span>
+      </div>
+    </div>
   );
 }

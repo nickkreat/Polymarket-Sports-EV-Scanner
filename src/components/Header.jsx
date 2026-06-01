@@ -1,6 +1,6 @@
 import { TrendingUp, Settings as SettingsIcon, RefreshCw, Activity } from 'lucide-react';
 
-export default function Header({ onSettingsOpen, onScan, scanning, lastScanned, stats }) {
+export default function Header({ onSettingsOpen, onScan, scanning, lastScanned, stats, mode, onModeChange }) {
   return (
     <header className="sticky top-0 z-40 bg-[#0a0a0b]/95 backdrop-blur border-b border-[#27272a]">
       <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-4">
@@ -20,12 +20,35 @@ export default function Header({ onSettingsOpen, onScan, scanning, lastScanned, 
           <div className="hidden md:flex items-center gap-4 ml-4 px-4 border-l border-[#27272a]">
             <Stat label="Poly markets" value={stats.polyMarketsScanned} />
             <Stat label="Odds events" value={stats.oddsEventsScanned} />
+            {stats.oddsPapiGolfEvents > 0 && (
+              <Stat label="OddsPapi golf" value={stats.oddsPapiGolfEvents} highlight />
+            )}
             <Stat label="Matched" value={stats.matchedMarkets} />
             <Stat label="+EV found" value={stats.positiveEv} highlight />
           </div>
         )}
 
         <div className="flex-1" />
+
+        {/* Mode toggle */}
+        {onModeChange && (
+          <div className="flex rounded-lg border border-[#27272a] p-0.5 text-xs">
+            <button
+              type="button"
+              onClick={() => onModeChange('auto')}
+              className={`px-3 py-1.5 rounded-md transition-colors ${mode === 'auto' ? 'bg-[#27272a] text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}
+            >
+              Auto scan
+            </button>
+            <button
+              type="button"
+              onClick={() => onModeChange('manual')}
+              className={`px-3 py-1.5 rounded-md transition-colors ${mode === 'manual' ? 'bg-[#27272a] text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}
+            >
+              Manual lines
+            </button>
+          </div>
+        )}
 
         {/* Last scan time */}
         {lastScanned && (
@@ -36,6 +59,7 @@ export default function Header({ onSettingsOpen, onScan, scanning, lastScanned, 
         )}
 
         {/* Scan button */}
+        {mode !== 'manual' && (
         <button
           onClick={onScan}
           disabled={scanning}
@@ -44,6 +68,7 @@ export default function Header({ onSettingsOpen, onScan, scanning, lastScanned, 
           <RefreshCw className={`w-3.5 h-3.5 ${scanning ? 'animate-spin' : ''}`} />
           {scanning ? 'Scanning…' : 'Scan'}
         </button>
+        )}
 
         {/* Settings */}
         <button

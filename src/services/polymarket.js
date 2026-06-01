@@ -132,6 +132,9 @@ function normalizeMarket(m) {
   const parentEvent = m._parentEvent ?? m.events?.[0] ?? null;
   const rawTags     = Array.isArray(parentEvent?.tags) ? parentEvent.tags : [];
 
+  const lineRaw = m.line ?? m.groupItemThreshold;
+  const lineNum = lineRaw != null && lineRaw !== '' ? Number(lineRaw) : null;
+
   return {
     id:          m.id ?? m.conditionId,
     question:    m.question ?? m.title ?? '',
@@ -147,6 +150,13 @@ function normalizeMarket(m) {
     url:        buildUrl(m),
     slug:       parentEvent?.slug ?? m.groupSlug ?? m.slug ?? '',
     eventTitle: parentEvent?.title ?? null,
+    eventDescription: parentEvent?.description ?? '',
+    sportsMarketType: m.sportsMarketType ?? null,
+    line: Number.isFinite(lineNum) ? lineNum : null,
+    gameId: m.gameId ?? null,
+    showGmpSeries: Boolean(m.showGmpSeries),
+    showGmpOutcome: Boolean(m.showGmpOutcome),
+    groupItemTitle: m.groupItemTitle ?? '',
   };
 }
 

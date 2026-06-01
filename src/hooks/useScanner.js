@@ -1,9 +1,10 @@
 import { useState, useCallback, useRef } from 'react';
 import { fetchSportsMarkets } from '../services/polymarket';
-import { fetchAllFuturesOdds, fetchAllH2HOdds, fetchAllSpreadsOdds, fetchRelevantSportKeys } from '../services/oddsApi';
+import { fetchAllOddsEvents } from '../services/oddsProviders';
 import { americanToImplied } from '../utils/odds';
 import { evPercent, kellySizingYes, kellySizingNo } from '../utils/kelly';
-import { extractTeamFromQuestion, canonicalTeamName, teamMatchScore, isSportsMarket } from '../utils/matching';
+import { extractTeamFromQuestion, canonicalTeamName, teamMatchScore, isSportsMarket, isOverUnderOutcomes, isOverUnderOutcome } from '../utils/matching';
+import { classifyPolymarketMarket } from '../utils/marketClassification';
 
 const MIN_MATCH_SCORE = 0.66;
 
@@ -18,8 +19,8 @@ export function useScanner(settings) {
 
   const scan = useCallback(async () => {
     if (status === 'scanning') return;
-    if (!settings.oddsApiKey) {
-      setError('Please enter your Odds API key in Settings first.');
+    if (!settings.oddsApiKey && !settings.oddspApiKey) {
+      setError('Please enter at least one odds API key in Settings (The Odds API and/or OddsPapi).');
       setStatus('error');
       return;
     }
@@ -50,36 +51,16 @@ export function useScanner(settings) {
           nonSports.slice(0, 3).map(m => m.question?.slice(0, 60)));
       }
 
-      setStatus('scanning — discovering available sports…');
-      const { futuresSportKeys, h2hSportKeys } = await fetchRelevantSportKeys(settings.oddsApiKey);
-      console.debug(`[Scanner] Sport keys: ${futuresSportKeys.length} futures, ${h2hSportKeys.length} H2H`);
+      const setScanStatus = (msg) => setStatus(msg);
+      const oddsResult = await fetchAllOddsEvents(settings, setScanStatus);
+      const { events: oddsEvents, sources, meta: oddsMeta } = oddsResult;
 
-      setStatus('scanning — fetching sportsbook futures odds…');
-      const futuresEvents = await fetchAllFuturesOdds(
-        settings.oddsApiKey,
-        futuresSportKeys,
-        { regions: settings.preferredRegions }
+      console.debug('[Scanner] Odds sources:', sources);
+      console.debug(
+        `[Scanner] Odds events: ${oddsEvents.length} total` +
+        (oddsMeta ? ` (${oddsMeta.futures} futures + ${oddsMeta.h2h} H2H + ${oddsMeta.spreads} spreads + ${oddsMeta.totals} totals` +
+        (oddsMeta.supplemental ? ` + ${oddsMeta.supplemental} supplemental` : '') + ')' : '')
       );
-      console.debug(`[Scanner] Odds API futures: ${futuresEvents.length} events`);
-
-      setStatus('scanning — fetching sportsbook game odds…');
-      const h2hEvents = await fetchAllH2HOdds(
-        settings.oddsApiKey,
-        h2hSportKeys,
-        { regions: settings.preferredRegions }
-      );
-      console.debug(`[Scanner] Odds API H2H: ${h2hEvents.length} game events`);
-
-      setStatus('scanning — fetching sportsbook spread/handicap odds…');
-      const spreadsEvents = await fetchAllSpreadsOdds(
-        settings.oddsApiKey,
-        h2hSportKeys,
-        { regions: settings.preferredRegions }
-      );
-      console.debug(`[Scanner] Odds API spreads: ${spreadsEvents.length} spread events`);
-
-      const oddsEvents = [...futuresEvents, ...h2hEvents, ...spreadsEvents];
-      console.debug(`[Scanner] Odds API total: ${oddsEvents.length} events (${futuresEvents.length} futures + ${h2hEvents.length} H2H + ${spreadsEvents.length} spreads)`);
       if (oddsEvents.length > 0) {
         console.debug('[Scanner] Sample events:', oddsEvents.slice(0, 5).map(e => ({
           sport: e.sport_key,
@@ -100,9 +81,13 @@ export function useScanner(settings) {
       setScanStats({
         polyMarketsScanned:       polyMarkets.length,
         oddsEventsScanned:        oddsEvents.length,
-        futuresEventsScanned:     futuresEvents.length,
-        h2hEventsScanned:         h2hEvents.length,
-        spreadsEventsScanned:     spreadsEvents.length,
+        futuresEventsScanned:     sources?.theOddsApi?.futures ?? oddsMeta?.futures ?? 0,
+        h2hEventsScanned:         sources?.theOddsApi?.h2h ?? oddsMeta?.h2h ?? 0,
+        spreadsEventsScanned:     sources?.theOddsApi?.spreads ?? oddsMeta?.spreads ?? 0,
+        totalsEventsScanned:      sources?.theOddsApi?.totals ?? oddsMeta?.totals ?? 0,
+        supplementalOddsEvents:   oddsMeta?.supplemental ?? 0,
+        oddsPapiGolfEvents:       sources?.oddsPapi?.events ?? 0,
+        draftKingsGolfEvents:     sources?.draftKingsGolf?.playerCount ? 1 : 0,
         skippedNonSports:         stats.skippedNonSports,
         binaryMarketsChecked:     stats.binaryChecked,
         binaryNoQuestionMatch:    stats.binaryNoQuestion,
@@ -181,9 +166,17 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
       continue;
     }
 
-    // Skip market types with no sportsbook equivalent (top-N finish, set betting, etc.)
-    if (isUnsupportedMarketType(market.question)) {
+    // Skip market types with no sportsbook equivalent (top-N finish, set betting, props, parlays, etc.)
+    if (isUnsupportedMarketType(market)) {
       stats.skippedUnsupported++;
+      continue;
+    }
+
+    const isChampQuestion = isChampionshipQuestion(market.question, market.eventTitle);
+    const typeRoute = resolveMarketTypeFlags(market, isChampQuestion);
+    if (typeRoute.skip) {
+      stats.skippedUnsupported++;
+      console.debug(`[Scanner] Skipped ${typeRoute.reason ?? 'unsupported'}: "${market.question?.slice(0, 70)}" type=${market.sportsMarketType ?? '?'}`);
       continue;
     }
 
@@ -213,18 +206,21 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 
       if (!yesPrice || yesPrice <= 0 || yesPrice >= 1) continue;
 
-      const isChamp  = isChampionshipQuestion(market.question);
-      const isSpread = !isChamp && isSpreadQuestion(market.question);
-      const isTotals = !isChamp && !isSpread && isTotalsQuestion(market.question);
-      const isGame   = !isChamp && !isSpread && !isTotals && isGameQuestion(market.question);
+      const isChamp  = typeRoute.isChampionship;
+      const isSpread = typeRoute.isSpread;
+      const isTotals = typeRoute.isTotals;
+      const isGame   = typeRoute.isGame;
+      const sportHint = sportKeyFromTags(market.tags) || sportKeyFromQuestion(market.question);
 
       let trueProb, bestBook, bestOdds, noVigProb, totalBooks, event, bookBreakdown;
+      let matchMarketType = null;
+      let matchedLinePoint = null;
 
       // ── Path Spread: spread/handicap question → spread market matching ─────
       // Must be checked BEFORE the H2H path to avoid using moneyline win%
       // as the reference probability for covering a spread.
       if (isSpread) {
-        const targetSpread = extractSpreadFromQuestion(market.question);
+        const targetSpread = extractSpreadFromQuestion(market.question, typeRoute.line);
         const spreadsPool  = oddsEvents.filter(e =>
           e.bookmakers?.some(b => b.markets?.some(m => m.key === 'spreads' || m.key === 'alternate_spreads'))
         );
@@ -233,9 +229,9 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         let spreadTeam = null;
 
         // Try dual-team parse for accurate event matching
-        const parsed = parseGameQuestion(market.question);
+        const parsed = parseGameQuestion(market.question, sportHint);
         if (parsed) {
-          spreadEvt  = findH2HEvent(parsed.teamA, parsed.teamB, spreadsPool, market.endDate);
+          spreadEvt  = findH2HEvent(parsed.teamA, parsed.teamB, spreadsPool, market.endDate, sportHint);
           spreadTeam = parsed.teamA;
         }
 
@@ -243,7 +239,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         if (!spreadEvt) {
           const teamName = extractTeamFromQuestion(market.question);
           if (teamName) {
-            spreadEvt  = findSpreadEventForTeam(teamName, spreadsPool, market.endDate);
+            spreadEvt  = findSpreadEventForTeam(teamName, spreadsPool, market.endDate, sportHint);
             spreadTeam = teamName;
           }
         }
@@ -259,6 +255,8 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             totalBooks    = p.totalBooks;
             event         = spreadEvt;
             bookBreakdown = p.bookBreakdown;
+            matchMarketType = 'spreads';
+            matchedLinePoint = p.matchedPoint ?? targetSpread;
             console.debug(
               `[Match-Spread] "${market.question}" → ${spreadTeam} spread=${targetSpread}` +
               ` trueProb=${(trueProb * 100).toFixed(1)}% books=${totalBooks}`
@@ -274,14 +272,71 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         }
       }
 
+      // ── Path Totals: over/under question → totals market matching ───────────
+      if (isTotals) {
+        if (isSeriesTotalQuestion(market.question)) {
+          stats.binaryNoOddsMatch++;
+          console.debug(`[Scanner] Series total (no sportsbook equivalent): "${market.question}"`);
+          continue;
+        }
+
+        const targetTotal = extractTotalFromQuestion(market.question, outcomes, typeRoute.line);
+        const totalsPool  = oddsEvents.filter(e =>
+          e.bookmakers?.some(b => b.markets?.some(m => m.key === 'totals' || m.key === 'alternate_totals'))
+        );
+
+        let totalsEvt = null;
+        let totalsSide = null;
+
+        const parsed = parseGameQuestion(market.question, sportHint)
+          ?? (market.eventTitle ? parseGameQuestion(market.eventTitle, sportHint) : null);
+        if (parsed) {
+          totalsEvt  = findH2HEvent(parsed.teamA, parsed.teamB, totalsPool, market.endDate, sportHint);
+          totalsSide = inferTotalsSide(market.question, outcomes, yesIdx >= 0 ? yesIdx : 0);
+        }
+
+        if (!totalsEvt) {
+          const teamName = extractTeamFromQuestion(market.question);
+          if (teamName) {
+            totalsEvt  = findSpreadEventForTeam(teamName, totalsPool, market.endDate, sportHint);
+            totalsSide = inferTotalsSide(market.question, outcomes, yesIdx >= 0 ? yesIdx : 0);
+          }
+        }
+
+        if (totalsEvt && totalsSide) {
+          const p = getTotalsProbForSide(totalsEvt, totalsSide, targetTotal, deviGMethod);
+          if (p) {
+            trueProb      = p.trueProb;
+            noVigProb     = p.trueProb;
+            bestBook      = p.bestBook;
+            bestOdds      = p.bestOdds;
+            totalBooks    = p.totalBooks;
+            event         = totalsEvt;
+            bookBreakdown = p.bookBreakdown;
+            matchMarketType = 'totals';
+            matchedLinePoint = p.matchedPoint ?? targetTotal;
+            console.debug(
+              `[Match-Totals] "${market.question}" → ${totalsSide} total=${targetTotal}` +
+              ` trueProb=${(trueProb * 100).toFixed(1)}% books=${totalBooks}`
+            );
+          }
+        }
+
+        if (trueProb === undefined) {
+          stats.binaryNoOddsMatch++;
+          console.debug(`[Scanner] No totals odds match for: "${market.question}" total=${targetTotal}`);
+          continue;
+        }
+      }
+
       // ── Path A: game question → dual-team H2H matching ────────────────────
       if (isGame) {
-        const parsed = parseGameQuestion(market.question);
+        const parsed = parseGameQuestion(market.question, sportHint);
         if (parsed) {
           const h2hPool = oddsEvents.filter(e =>
             e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
           );
-          const h2hEvt = findH2HEvent(parsed.teamA, parsed.teamB, h2hPool, market.endDate);
+          const h2hEvt = findH2HEvent(parsed.teamA, parsed.teamB, h2hPool, market.endDate, sportHint);
           if (h2hEvt) {
             const p = getH2HProbForTeam(h2hEvt, parsed.teamA, deviGMethod);
             if (p) {
@@ -293,6 +348,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
               totalBooks    = p.totalBooks;
               event         = h2hEvt;
               bookBreakdown = p.bookBreakdown;
+              matchMarketType = 'h2h';
               console.debug(
                 `[Match-H2H] "${market.question}" → ${parsed.teamA} vs ${parsed.teamB}` +
                 ` trueProb=${(trueProb * 100).toFixed(1)}% flip=${flip} books=${totalBooks}`
@@ -323,7 +379,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           stats.binaryNoQuestion++;
           continue;
         }
-        const match = findBestOddsMatch(teamName, oddsEvents, market.tags, market.question, deviGMethod);
+        const match = findBestOddsMatch(teamName, oddsEvents, market.tags, market.question, deviGMethod, market.eventTitle, typeRoute);
         if (!match) {
           stats.binaryNoOddsMatch++;
           console.debug(`[Scanner] No odds match for: "${market.question}" → team="${teamName}"`);
@@ -337,6 +393,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         totalBooks    = match.totalBooks;
         event         = match.event;
         bookBreakdown = match.bookBreakdown;
+        matchMarketType = match.matchMarketType;
       }
 
       if (trueProb === undefined) {
@@ -403,6 +460,9 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         endDate:    market.endDate,
         event,
         bookBreakdown,
+        matchMarketType,
+        matchedLinePoint,
+        bookLinkContext: makeBookLinkContext(event, inferSport(market.tags, event?.sport_key), matchMarketType, matchedLinePoint, bestSide),
         isMultiOutcome: false,
         suspiciousEv,
       });
@@ -417,37 +477,19 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 
       // Two-team spread market (e.g. "Spread: White Sox (-3.5)" outcomes: ["White Sox","Twins"])
       // Must be checked BEFORE isGameMoneyline to prevent routing to H2H moneyline pool.
-      const isTwoTeamSpread = (() => {
-        if (outcomes.length !== 2) return false;
-        if (!isSpreadQuestion(market.question)) return false;
-        const lower = outcomes.map(o => String(o).toLowerCase().trim());
-        const nonTeam = ['over', 'under', 'odd', 'even', 'yes', 'no', 'draw'];
-        if (lower.some(o => nonTeam.includes(o) || /^\d/.test(o))) return false;
-        const ca = canonicalTeamName(lower[0]);
-        const cb = canonicalTeamName(lower[1]);
-        return ca && cb && ca !== cb && ca.length > 2 && cb.length > 2;
-      })();
-
-      const isGameMoneyline = (() => {
-        if (outcomes.length !== 2) return false;
-        // Guard: spread/totals markets have two team names but are NOT moneylines
-        if (isSpreadQuestion(market.question)) return false;
-        if (isTotalsQuestion(market.question)) return false;
-        const lower = outcomes.map(o => String(o).toLowerCase().trim());
-        const nonTeam = ['over', 'under', 'odd', 'even', 'yes', 'no', 'draw'];
-        if (lower.some(o => nonTeam.includes(o) || /^\d/.test(o))) return false;
-        const ca = canonicalTeamName(lower[0]);
-        const cb = canonicalTeamName(lower[1]);
-        return ca && cb && ca !== cb && ca.length > 2 && cb.length > 2;
-      })();
+      const sportHint = sportKeyFromTags(market.tags) || sportKeyFromQuestion(market.question);
+      const multiKind = resolveMultiOutcomeKind(market, outcomes, sportHint, typeRoute);
+      const isTwoTeamSpread = multiKind === 'spread';
+      const isTwoTeamTotals = multiKind === 'totals';
+      const isGameMoneyline = multiKind === 'moneyline';
 
       if (isTwoTeamSpread) {
         // ── Case Spread: Two-team spread/handicap market ───────────────────
         // e.g. "Spread: White Sox (-3.5)" → outcomes: ["White Sox","Twins"]
         stats.multiChecked += 2;
-        const targetSpread = extractSpreadFromQuestion(market.question);
-        const teamA  = canonicalTeamName(String(outcomes[0]));
-        const teamB  = canonicalTeamName(String(outcomes[1]));
+        const targetSpread = extractSpreadFromQuestion(market.question, typeRoute.line);
+        const teamA  = canonicalTeamName(String(outcomes[0]), { sportHint });
+        const teamB  = canonicalTeamName(String(outcomes[1]), { sportHint });
         const priceA = normPrices[0];
         const priceB = normPrices[1];
 
@@ -458,7 +500,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             m.key === 'spreads' || m.key === 'alternate_spreads'
           ))
         );
-        const spreadEvt = findH2HEvent(teamA, teamB, spreadsPool, market.endDate);
+        const spreadEvt = findH2HEvent(teamA, teamB, spreadsPool, market.endDate, sportHint);
 
         if (!spreadEvt) {
           stats.multiNoOddsMatch++;
@@ -527,6 +569,9 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           endDate:          market.endDate,
           event:            spreadEvt,
           bookBreakdown:    pA.bookBreakdown,
+          matchMarketType:  'spreads',
+          matchedLinePoint: pA.matchedPoint ?? targetSpread,
+          bookLinkContext:  makeBookLinkContext(spreadEvt, inferSport(market.tags, spreadEvt?.sport_key), 'spreads', pA.matchedPoint ?? targetSpread, bestSide),
           isMultiOutcome:   true,
           isSpreadMarket:   true,
           matchedSpreadPoint: pA.matchedPoint,
@@ -535,11 +580,107 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         });
         continue; // don't fall through to isGameMoneyline
 
+      } else if (isTwoTeamTotals) {
+        stats.multiChecked += 2;
+        const targetTotal = extractTotalFromQuestion(market.question, outcomes, typeRoute.line);
+        const parsed      = parseGameQuestion(market.question, sportHint)
+          ?? (market.eventTitle ? parseGameQuestion(market.eventTitle, sportHint) : null);
+        if (!parsed) {
+          stats.multiNoOddsMatch++;
+          console.debug(`[Scanner] No teams parsed for totals: "${market.question}"`);
+          continue;
+        }
+
+        const priceOver  = normPrices[outcomes.findIndex(o => String(o).toLowerCase().startsWith('over'))];
+        const priceUnder = normPrices[outcomes.findIndex(o => String(o).toLowerCase().startsWith('under'))];
+        if (!priceOver || priceOver <= 0 || priceOver >= 1) continue;
+
+        const totalsPool = oddsEvents.filter(e =>
+          e.bookmakers?.some(b => b.markets?.some(m => m.key === 'totals' || m.key === 'alternate_totals'))
+        );
+        const totalsEvt = findH2HEvent(parsed.teamA, parsed.teamB, totalsPool, market.endDate, sportHint);
+        if (!totalsEvt) {
+          stats.multiNoOddsMatch++;
+          console.debug(`[Scanner] No totals event: "${market.question}" → ${parsed.teamA} vs ${parsed.teamB}`);
+          continue;
+        }
+
+        const pOver = getTotalsProbForSide(totalsEvt, 'Over', targetTotal, deviGMethod);
+        if (!pOver) {
+          stats.multiNoOddsMatch++;
+          console.debug(`[Scanner] No totals prob: "${market.question}" total=${targetTotal}`);
+          continue;
+        }
+
+        const evOver  = evPercent(pOver.trueProb, priceOver);
+        const evUnder = evPercent(1 - pOver.trueProb, priceUnder);
+        const bestSide      = evOver >= evUnder ? 'Over' : 'Under';
+        const bestEv        = bestSide === 'Over' ? evOver : evUnder;
+        const bestPrice     = bestSide === 'Over' ? priceOver : priceUnder;
+        const bestTrueProb  = bestSide === 'Over' ? pOver.trueProb : 1 - pOver.trueProb;
+
+        if (market.liquidity < settings.minLiquidity) { stats.filteredLiquidity++; continue; }
+        if (!settings.showNegativeEv && bestEv <= 0)  { stats.filteredEv++; continue; }
+        if (bestEv < settings.minEvPct)               { stats.filteredEv++; continue; }
+
+        const suspiciousEv = Math.abs(bestEv) > 200;
+        if (suspiciousEv) {
+          console.warn(`[Scanner] Extreme EV ${bestEv.toFixed(0)}% — verify: "${market.question}"`);
+          if (settings.hideSuspiciousEv) { stats.filteredEv++; continue; }
+        }
+
+        const kellySizing = kellySizingYes({ trueProb: bestTrueProb, marketPrice: bestPrice, bankroll, fraction });
+        const cappedPct   = Math.min(kellySizing.adjustedPct, maxKellyPct);
+
+        console.debug(
+          `[Match-Totals2T] "${market.question}" → ${parsed.teamA} vs ${parsed.teamB}` +
+          ` total=${targetTotal} matchedPoint=${pOver.matchedPoint}` +
+          ` bestSide=${bestSide} EV=${bestEv.toFixed(1)}% books=${pOver.totalBooks}`
+        );
+
+        results.push({
+          id:               `${market.id}-totals`,
+          question:         market.question,
+          url:              market.url,
+          sport:            inferSport(market.tags, totalsEvt?.sport_key),
+          side:             bestSide,
+          evPct:            bestEv,
+          marketPrice:      bestPrice,
+          trueProb:         bestTrueProb,
+          noVigProb:        pOver.trueProb,
+          yesPrice:         priceOver,
+          noPrice:          priceUnder,
+          yesEv:            evOver,
+          noEv:             evUnder,
+          bestBook:         pOver.bestBook,
+          bestOdds:         pOver.bestOdds,
+          totalBooks:       pOver.totalBooks,
+          kelly: {
+            fullKellyPct: kellySizing.kellyPct,
+            adjustedPct:  cappedPct,
+            betSize:      cappedPct * bankroll,
+            fraction,
+          },
+          liquidity:        market.liquidity,
+          volume:           market.volume,
+          endDate:          market.endDate,
+          event:            totalsEvt,
+          bookBreakdown:    pOver.bookBreakdown,
+          matchMarketType:  'totals',
+          matchedLinePoint: pOver.matchedPoint ?? targetTotal,
+          bookLinkContext:  makeBookLinkContext(totalsEvt, inferSport(market.tags, totalsEvt?.sport_key), 'totals', pOver.matchedPoint ?? targetTotal, bestSide),
+          isMultiOutcome:   true,
+          isTotalsMarket:   true,
+          outcomeLabel:     bestSide,
+          suspiciousEv,
+        });
+        continue;
+
       } else if (isGameMoneyline) {
         // ── Case A: Game moneyline ─────────────────────────────────────────
         stats.multiChecked += 2;
-        const teamA  = canonicalTeamName(String(outcomes[0]));
-        const teamB  = canonicalTeamName(String(outcomes[1]));
+        const teamA  = canonicalTeamName(String(outcomes[0]), { sportHint });
+        const teamB  = canonicalTeamName(String(outcomes[1]), { sportHint });
         const priceA = normPrices[0];
         const priceB = normPrices[1];
 
@@ -548,7 +689,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
         const h2hPool = oddsEvents.filter(e =>
           e.bookmakers?.some(b => b.markets?.some(m => m.key === 'h2h'))
         );
-        const h2hEvt = findH2HEvent(teamA, teamB, h2hPool, market.endDate);
+        const h2hEvt = findH2HEvent(teamA, teamB, h2hPool, market.endDate, sportHint);
 
         if (h2hEvt) {
           const pA = getH2HProbForTeam(h2hEvt, teamA, deviGMethod);
@@ -605,6 +746,8 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
               endDate:        market.endDate,
               event:          h2hEvt,
               bookBreakdown:  pA.bookBreakdown,
+              matchMarketType: 'h2h',
+              bookLinkContext: makeBookLinkContext(h2hEvt, inferSport(market.tags, h2hEvt?.sport_key), 'h2h', null, bestSide),
               isMultiOutcome: true,
               isGameMoneyline: true,
               outcomeLabel:   bestSide,
@@ -612,6 +755,11 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             });
           }
         }
+
+      } else if (isPolymarketGameLineMarket(market) || typeRoute.isSpread || typeRoute.isTotals || typeRoute.isGame) {
+        stats.multiNoOddsMatch++;
+        console.debug(`[Scanner] Typed game line could not be matched: "${market.question}" type=${market.sportsMarketType ?? '?'}`);
+        continue;
 
       } else {
         // ── Case B: Futures/outright with named outcomes ───────────────────
@@ -623,7 +771,7 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
           if (!outcomeName || outcomeName.toLowerCase() === 'yes' || outcomeName.toLowerCase() === 'no') continue;
           if (!outcomePrice || outcomePrice <= 0 || outcomePrice >= 1) continue;
 
-          const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question, deviGMethod);
+          const match = findBestOddsMatch(outcomeName, oddsEvents, market.tags, market.question, deviGMethod, market.eventTitle, typeRoute);
           if (!match) {
             stats.multiNoOddsMatch++;
             continue;
@@ -667,6 +815,8 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
             endDate:        market.endDate,
             event,
             bookBreakdown,
+            matchMarketType: match.matchMarketType,
+            bookLinkContext: makeBookLinkContext(event, inferSport(market.tags, event?.sport_key), match.matchMarketType, null, outcomeName),
             isMultiOutcome: true,
             outcomeLabel:   outcomeName,
           });
@@ -684,11 +834,11 @@ async function buildOpportunities(polyMarkets, oddsEvents, settings) {
 // Parse a game question to extract BOTH competing teams so we can find the
 // exact H2H event rather than fuzzy-searching on just one team name.
 // Returns { teamA, teamB } where teamA = YES subject, or null if unrecognised.
-function parseGameQuestion(question) {
+function parseGameQuestion(question, sportHint = null) {
   const tryPair = (a, b) => {
     if (!a || !b) return null;
-    const ca = canonicalTeamName(a.trim().replace(/[?!.,]$/, ''));
-    const cb = canonicalTeamName(b.trim().replace(/[?!.,]$/, ''));
+    const ca = canonicalTeamName(a.trim().replace(/[?!.,]$/, ''), { sportHint });
+    const cb = canonicalTeamName(b.trim().replace(/[?!.,]$/, ''), { sportHint });
     if (!ca || !cb || ca.length < 2 || cb.length < 2 || ca === cb) return null;
     return { teamA: ca, teamB: cb };
   };
@@ -703,6 +853,9 @@ function parseGameQuestion(question) {
   if (m) return tryPair(m[1], m[2]);
 
   // "[A] vs [B]" / "Will the [A] vs [B]"
+  m = question.match(/(?:will (?:the )?)?(.+?)\s+vs\.?\s+(?:the )?(.+?)\s*:\s*(?:o\/u|over\/under|total)/i);
+  if (m) return tryPair(m[1], m[2]);
+
   m = question.match(/(?:will (?:the )?)?(.+?)\s+vs\.?\s+(?:the )?(.+?)(?:\s*[-—,?]|\?|\s+game\s|\s*$)/i);
   if (m) return tryPair(m[1], m[2]);
 
@@ -721,18 +874,19 @@ function parseGameQuestion(question) {
 // This prevents "Thunder vs Suns" matching when the question is "Thunder vs Wolves".
 // endDate: the Polymarket market's endDate — used to prefer events whose commence_time
 // is within 3 days, so series games (Mon/Tue/Wed) match the correct game date.
-function findH2HEvent(teamA, teamB, h2hEvents, endDate = null) {
+function findH2HEvent(teamA, teamB, h2hEvents, endDate = null, sportHint = null) {
   let bestEvent     = null;
   let bestTeamScore = MIN_MATCH_SCORE - 0.001;
   let bestDateDiff  = Infinity;
 
   const endMs = endDate ? Date.parse(endDate) : NaN;
+  const matchOpts = sportHint ? { sportHint } : {};
 
   for (const event of h2hEvents) {
-    const homeA = teamMatchScore(teamA, event.home_team ?? '');
-    const awayA = teamMatchScore(teamA, event.away_team ?? '');
-    const homeB = teamMatchScore(teamB, event.home_team ?? '');
-    const awayB = teamMatchScore(teamB, event.away_team ?? '');
+    const homeA = teamMatchScore(teamA, event.home_team ?? '', matchOpts);
+    const awayA = teamMatchScore(teamA, event.away_team ?? '', matchOpts);
+    const homeB = teamMatchScore(teamB, event.home_team ?? '', matchOpts);
+    const awayB = teamMatchScore(teamB, event.away_team ?? '', matchOpts);
 
     // A=home & B=away, or A=away & B=home — take the better combination
     const teamScore = Math.max(Math.min(homeA, awayB), Math.min(awayA, homeB));
@@ -843,8 +997,8 @@ const CHAMPIONSHIP_KEYWORDS = [
   'win the league', 'win the title', 'win the cup', 'win the series',
 ];
 
-function isChampionshipQuestion(question) {
-  const q = question.toLowerCase();
+function isChampionshipQuestion(question, eventTitle = '') {
+  const q = `${question} ${eventTitle}`.toLowerCase();
   return CHAMPIONSHIP_KEYWORDS.some(kw => q.includes(kw));
 }
 
@@ -896,7 +1050,7 @@ function sportKeyFromTags(tags = []) {
   if (t.includes('mlb'))                              return 'baseball_mlb';
   if (t.includes('nhl'))                              return 'icehockey_nhl';
   if (t.includes('soccer') || t.includes('mls') ||
-      t.includes('epl')    || t.includes('champions'))return 'soccer';
+      t.includes('epl')    || t.includes('champions league'))return 'soccer';
   if (t.includes('ufc')    || t.includes('mma'))      return 'mma';
   if (t.includes('boxing'))                           return 'boxing';
   if (t.includes('golf')   || t.includes('pga'))      return 'golf';
@@ -912,8 +1066,8 @@ function sportKeyFromTags(tags = []) {
 // e.g. "Stanley Cup Champion", "Eastern Conference", "Super Bowl Winner").
 // Prevents "Will Montreal win the Stanley Cup?" matching an Eastern Conference event
 // where Montreal has a higher devigged probability → fake +EV.
-function extractEventTopic(question) {
-  const q = question.toLowerCase();
+function extractEventTopic(question, eventTitle = '') {
+  const q = `${question} ${eventTitle}`.toLowerCase();
   if (q.includes('stanley cup'))                        return 'stanley cup';
   if (q.includes('super bowl'))                         return 'super bowl';
   if (q.includes('world series'))                       return 'world series';
@@ -927,6 +1081,18 @@ function extractEventTopic(question) {
   if (q.includes('nfc championship'))                   return 'nfc';
   if (q.includes('afc championship'))                   return 'afc';
   if (q.includes('masters') && !q.includes('basketball')) return 'masters';
+  if (q.includes('charles schwab challenge'))           return 'charles schwab';
+  if (q.includes('charles schwab'))                     return 'charles schwab';
+  if (q.includes('colonial country club'))              return 'charles schwab';
+  if (q.includes('tour championship'))                  return 'tour championship';
+  if (q.includes('rbc heritage'))                       return 'rbc heritage';
+  if (q.includes('travelers championship'))             return 'travelers';
+  if (q.includes('memorial tournament'))                return 'memorial';
+  if (q.includes('bmw championship'))                   return 'bmw';
+  if (q.includes('genesis invitational'))               return 'genesis';
+  if (q.includes('players championship'))               return 'players';
+  if (q.includes('fedex cup'))                            return 'fedex';
+  if (q.includes('british open') || q.includes('the open championship')) return 'open championship';
   if (q.includes('wimbledon'))                          return 'wimbledon';
   if (q.includes('french open') || q.includes('roland garros')) return 'french open';
   if (q.includes('australian open'))                    return 'australian open';
@@ -935,6 +1101,92 @@ function extractEventTopic(question) {
 }
 
 // ── Spread / totals question classifiers ──────────────────────────────────────
+
+function resolveMarketTypeFlags(market, isChampionship) {
+  const cls = classifyPolymarketMarket(market, { isChampionship });
+  if (cls.skip) return { skip: true, reason: cls.reason };
+
+  const line = cls.line ?? market.line ?? null;
+
+  if (cls.bookType === 'spreads') {
+    return { skip: false, isSpread: true, isTotals: false, isGame: false, isChampionship, line };
+  }
+  if (cls.bookType === 'totals') {
+    return { skip: false, isSpread: false, isTotals: true, isGame: false, isChampionship, line };
+  }
+  if (cls.bookType === 'h2h') {
+    return { skip: false, isSpread: false, isTotals: false, isGame: true, isChampionship: false, line: null };
+  }
+  if (cls.bookType === 'outrights') {
+    return { skip: false, isSpread: false, isTotals: false, isGame: false, isChampionship: true, line: null };
+  }
+
+  const isChamp = isChampionship;
+  const isSpread = !isChamp && isSpreadQuestion(market.question);
+  const isTotals = !isChamp && !isSpread && (isTotalsQuestion(market.question) || isSeriesTotalQuestion(market.question));
+  const isGame   = !isChamp && !isSpread && !isTotals && isGameQuestion(market.question);
+  return { skip: false, isSpread, isTotals, isGame, isChampionship: isChamp, line };
+}
+
+function isValidTwoTeamSpread(outcomes, sportHint) {
+  if (outcomes.length !== 2 || isOverUnderOutcomes(outcomes)) return false;
+  const lower = outcomes.map(o => String(o).toLowerCase().trim());
+  const nonTeam = ['over', 'under', 'odd', 'even', 'yes', 'no', 'draw'];
+  if (lower.some(o => nonTeam.includes(o) || /^\d/.test(o))) return false;
+  const ca = canonicalTeamName(lower[0], { sportHint });
+  const cb = canonicalTeamName(lower[1], { sportHint });
+  return ca && cb && ca !== cb && ca.length > 2 && cb.length > 2;
+}
+
+function isValidTwoTeamTotals(outcomes, question) {
+  if (outcomes.length !== 2 || isSeriesTotalQuestion(question)) return false;
+  const lower = outcomes.map(o => String(o).toLowerCase().trim());
+  return lower.some(o => o.startsWith('over')) && lower.some(o => o.startsWith('under'));
+}
+
+function isValidTwoTeamMoneyline(outcomes, sportHint) {
+  if (outcomes.length !== 2) return false;
+  if (isOverUnderOutcomes(outcomes)) return false;
+  const lower = outcomes.map(o => String(o).toLowerCase().trim());
+  const nonTeam = ['over', 'under', 'odd', 'even', 'yes', 'no', 'draw'];
+  if (lower.some(o => nonTeam.includes(o) || isOverUnderOutcome(o) || /^\d/.test(o))) return false;
+  const ca = canonicalTeamName(lower[0], { sportHint });
+  const cb = canonicalTeamName(lower[1], { sportHint });
+  return ca && cb && ca !== cb && ca.length > 2 && cb.length > 2;
+}
+
+function resolveMultiOutcomeKind(market, outcomes, sportHint, typeRoute) {
+  const polyType = (market.sportsMarketType ?? '').toLowerCase();
+
+  if (polyType === 'spreads' || polyType === 'first_half_spreads') {
+    return isValidTwoTeamSpread(outcomes, sportHint) ? 'spread' : null;
+  }
+  if (polyType === 'totals' || polyType === 'first_half_totals') {
+    return isValidTwoTeamTotals(outcomes, market.question) ? 'totals' : null;
+  }
+  if (polyType === 'moneyline' || polyType === 'child_moneyline' || polyType === 'first_half_moneyline') {
+    return isValidTwoTeamMoneyline(outcomes, sportHint) ? 'moneyline' : null;
+  }
+
+  if (typeRoute.isSpread && isValidTwoTeamSpread(outcomes, sportHint)) return 'spread';
+  if (typeRoute.isTotals && isValidTwoTeamTotals(outcomes, market.question)) return 'totals';
+  if (typeRoute.isGame && isValidTwoTeamMoneyline(outcomes, sportHint)) return 'moneyline';
+
+  // Legacy heuristics when Polymarket omits sportsMarketType
+  if (isValidTwoTeamSpread(outcomes, sportHint) && isSpreadQuestion(market.question)) return 'spread';
+  if (isValidTwoTeamTotals(outcomes, market.question) &&
+      (isTotalsQuestion(market.question) || isOverUnderOutcomes(outcomes))) return 'totals';
+  if (isValidTwoTeamMoneyline(outcomes, sportHint) &&
+      !isSpreadQuestion(market.question) &&
+      !isTotalsQuestion(market.question)) return 'moneyline';
+
+  return null;
+}
+
+function isPolymarketGameLineMarket(market) {
+  const t = (market.sportsMarketType ?? '').toLowerCase();
+  return ['moneyline', 'child_moneyline', 'first_half_moneyline', 'spreads', 'first_half_spreads', 'totals', 'first_half_totals'].includes(t);
+}
 
 function isSpreadQuestion(question) {
   const q = question.toLowerCase();
@@ -954,12 +1206,66 @@ function isSpreadQuestion(question) {
 
 function isTotalsQuestion(question) {
   const q = question.toLowerCase();
-  return /\b(over|under)\s+\d/.test(q) || /\btotal\b.*\d/.test(q);
+  return (
+    /\b(?:o\/u|over\/under)\b/.test(q) ||
+    /\b(over|under)\s+\d/.test(q) ||
+    /\btotal\b.*\d/.test(q)
+  );
+}
+
+// Playoff series length totals (e.g. "Total Games O/U 5.5") — no standard game-line equivalent.
+function isSeriesTotalQuestion(question) {
+  return /\btotal games\b/i.test(question);
+}
+
+function extractTotalFromQuestion(question, outcomes = [], lineHint = null) {
+  if (lineHint != null && Number.isFinite(Number(lineHint))) return Number(lineHint);
+
+  let m;
+  m = question.match(/\b(?:o\/u|over\/under)\s*([0-9]+(?:\.\d+)?)/i);
+  if (m) return parseFloat(m[1]);
+
+  m = question.match(/\b(?:over|under)\s+([0-9]+(?:\.\d+)?)/i);
+  if (m) return parseFloat(m[1]);
+
+  m = question.match(/\btotal\b[^0-9]*([0-9]+(?:\.\d+)?)/i);
+  if (m) return parseFloat(m[1]);
+
+  for (const outcome of outcomes) {
+    m = String(outcome).match(/(?:over|under)\s+([0-9]+(?:\.\d+)?)/i);
+    if (m) return parseFloat(m[1]);
+  }
+  return null;
+}
+
+function inferTotalsSide(question, outcomes, yesIdx = 0) {
+  const q = question.toLowerCase();
+  if (/\bunder\b/.test(q) && !/\bover\b/.test(q)) return 'Under';
+  if (/\bover\b/.test(q)) return 'Over';
+  const side = String(outcomes[yesIdx] ?? '').toLowerCase();
+  if (side.startsWith('under')) return 'Under';
+  if (side.startsWith('over')) return 'Over';
+  return 'Over';
+}
+
+function makeBookLinkContext(event, sport, marketType, point, side) {
+  return {
+    sport,
+    event,
+    marketType,
+    point,
+    side,
+    homeTeam: event?.home_team ?? null,
+    awayTeam: event?.away_team ?? null,
+  };
 }
 
 // Markets that have no direct sportsbook equivalent — skip entirely rather than
 // cross-matching against the wrong market (e.g. winner outrights for a top-5 finish).
-function isUnsupportedMarketType(question) {
+function isUnsupportedMarketType(marketOrQuestion) {
+  const question = typeof marketOrQuestion === 'string'
+    ? marketOrQuestion
+    : (marketOrQuestion?.question ?? '');
   const q = question.toLowerCase();
   // Top-N finish (golf/racing placement markets)
   if (/\btop[- ]?\d+\b/.test(q)) return true;
@@ -980,7 +1286,9 @@ function isUnsupportedMarketType(question) {
 
 // Extract the numeric point spread from a Polymarket question.
 // Returns a float (e.g. -3.5, +2.5) or null if not found.
-function extractSpreadFromQuestion(question) {
+function extractSpreadFromQuestion(question, lineHint = null) {
+  if (lineHint != null && Number.isFinite(Number(lineHint))) return Number(lineHint);
+
   let m;
   // "Berrettini (-2.5)" or "(+3.5)"
   m = question.match(/\(([+-]?\d+(?:\.\d+)?)\)/);
@@ -1004,16 +1312,17 @@ function extractSpreadFromQuestion(question) {
 // Find the best-matching spread event for a single team name.
 // Used when the question names only one side (e.g. "Will the Pirates cover -3.5?").
 // endDate: the Polymarket market's endDate — used for date-proximity tie-breaking.
-function findSpreadEventForTeam(teamName, spreadsEvents, endDate = null) {
+function findSpreadEventForTeam(teamName, spreadsEvents, endDate = null, sportHint = null) {
   let bestEvent     = null;
   let bestTeamScore = MIN_MATCH_SCORE - 0.001;
   let bestDateDiff  = Infinity;
 
   const endMs = endDate ? Date.parse(endDate) : NaN;
+  const matchOpts = sportHint ? { sportHint } : {};
 
   for (const event of spreadsEvents) {
-    const homeScore = teamMatchScore(teamName, event.home_team ?? '');
-    const awayScore = teamMatchScore(teamName, event.away_team ?? '');
+    const homeScore = teamMatchScore(teamName, event.home_team ?? '', matchOpts);
+    const awayScore = teamMatchScore(teamName, event.away_team ?? '', matchOpts);
     const teamScore = Math.max(homeScore, awayScore);
 
     if (teamScore < MIN_MATCH_SCORE) continue;
@@ -1121,6 +1430,85 @@ function getSpreadProbForTeam(event, teamName, targetSpread, deviGMethod = 'mult
   };
 }
 
+// Compute the devigged over/under probability for Over or Under at a target total.
+function getTotalsProbForSide(event, side, targetTotal, deviGMethod = 'multiplicative') {
+  const TOTAL_TOLERANCE = 0.6;
+  const totalsKeys = ['totals', 'alternate_totals'];
+  const wantOver = String(side).toLowerCase().startsWith('over');
+  const samples = [];
+
+  for (const book of event.bookmakers ?? []) {
+    for (const market of book.markets ?? []) {
+      if (!totalsKeys.includes(market.key)) continue;
+
+      const outcomes = market.outcomes ?? [];
+      if (outcomes.length < 2) continue;
+
+      const overIdx = outcomes.findIndex(o => String(o.name).toLowerCase().startsWith('over'));
+      const underIdx = outcomes.findIndex(o => String(o.name).toLowerCase().startsWith('under'));
+      if (overIdx === -1 || underIdx === -1) continue;
+
+      const point = outcomes[overIdx].point ?? outcomes[underIdx].point ?? null;
+      if (targetTotal !== null && point !== null && Math.abs(point - targetTotal) > TOTAL_TOLERANCE) continue;
+
+      const impliedProbs = outcomes.map(o => americanToImplied(o.price));
+      const total = impliedProbs.reduce((s, p) => s + p, 0);
+      if (total <= 0) continue;
+
+      const idx = wantOver ? overIdx : underIdx;
+      let prob;
+      if (deviGMethod === 'additive') {
+        const vigPerSide = (total - 1) / outcomes.length;
+        const adjusted   = impliedProbs.map(p => Math.max(0, p - vigPerSide));
+        const adjSum     = adjusted.reduce((s, p) => s + p, 0);
+        prob = adjSum > 0 ? adjusted[idx] / adjSum : impliedProbs[idx] / total;
+      } else {
+        prob = impliedProbs[idx] / total;
+      }
+
+      samples.push({ prob, bookKey: book.key ?? '', bookTitle: book.title ?? '', point });
+    }
+  }
+
+  if (!samples.length) return null;
+
+  let wSum = 0, wTotal = 0;
+  for (const { prob, bookKey } of samples) {
+    const w = SHARP_BOOK_KEYS.has(bookKey) ? 2.0 : 1.0;
+    wSum   += prob * w;
+    wTotal += w;
+  }
+
+  const sharpSample = samples.find(s => SHARP_BOOK_KEYS.has(s.bookKey));
+  const bestSampleT = sharpSample ?? samples[0];
+
+  let bestOddsT = 0;
+  if (bestSampleT) {
+    outer: for (const book of event.bookmakers ?? []) {
+      if (book.key !== bestSampleT.bookKey) continue;
+      for (const market of book.markets ?? []) {
+        if (!totalsKeys.includes(market.key)) continue;
+        const outcomes = market.outcomes ?? [];
+        const idx = outcomes.findIndex(o =>
+          String(o.name).toLowerCase().startsWith(wantOver ? 'over' : 'under') &&
+          (targetTotal === null || Math.abs((o.point ?? 0) - targetTotal) <= TOTAL_TOLERANCE)
+        );
+        if (idx !== -1) { bestOddsT = outcomes[idx].price; break outer; }
+      }
+    }
+  }
+
+  const breakdownSide = wantOver ? 'Over' : 'Under';
+  return {
+    trueProb:      wSum / wTotal,
+    totalBooks:    samples.length,
+    bestBook:      bestSampleT?.bookTitle ?? '',
+    bestOdds:      bestOddsT,
+    matchedPoint:  samples[0]?.point ?? null,
+    bookBreakdown: collectBookBreakdown(event, breakdownSide, totalsKeys),
+  };
+}
+
 // Returns true for questions where YES = the named team DOES NOT do the positive thing.
 // Used to flip the sportsbook probability so YES EV is computed against the correct side.
 // e.g. "Will the Lakers miss the playoffs?" → YES = Lakers miss → flip sportsbook make-playoffs prob.
@@ -1148,11 +1536,11 @@ function isGameQuestion(question) {
 //   game question          → h2h only        (never championship futures)
 //   season-long / unclear  → outrights only  (safer: futures vs futures)
 // This stops "Spurs win NBA title" from matching the Spurs' next-game h2h price.
-function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', deviGMethod = 'multiplicative') {
-  const isChampionship = isChampionshipQuestion(question);
-  const isSpread       = !isChampionship && isSpreadQuestion(question);
-  const isTotals       = !isChampionship && !isSpread && isTotalsQuestion(question);
-  const isGame         = !isChampionship && !isSpread && !isTotals && isGameQuestion(question);
+function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', deviGMethod = 'multiplicative', eventTitle = '', typeRoute = null) {
+  const isChampionship = typeRoute?.isChampionship ?? isChampionshipQuestion(question, eventTitle);
+  const isSpread       = typeRoute?.isSpread ?? (!isChampionship && isSpreadQuestion(question));
+  const isTotals       = typeRoute?.isTotals ?? (!isChampionship && !isSpread && isTotalsQuestion(question));
+  const isGame         = typeRoute?.isGame ?? (!isChampionship && !isSpread && !isTotals && isGameQuestion(question));
 
   // Strict market-type routing: spread → spreads, totals → totals, game → h2h, else → outrights
   const allowedKeys = isSpread
@@ -1164,7 +1552,7 @@ function findBestOddsMatch(name, oddsEvents, marketTags = [], question = '', dev
     : ['outrights'];
 
   const sportHint = sportKeyFromTags(marketTags) || sportKeyFromQuestion(question);
-  const topicHint = isChampionship ? extractEventTopic(question) : null;
+  const topicHint = isChampionship ? extractEventTopic(question, eventTitle) : null;
 
   // Pre-filter event pool to only events that actually contain the right market type.
   const typePool = oddsEvents.filter(e =>
@@ -1288,6 +1676,7 @@ function collectBookBreakdown(event, targetOutcomeName, allowedKeys = ['outright
       breakdown.push({
         bookKey,
         bookTitle:    book.title ?? bookKey,
+        bookUrl:      book.url ?? event._fixturePath ?? null,
         americanOdds: outcomes[idx].price,
         impliedProb:  impliedProbs[idx],
         noVigProb:    impliedProbs[idx] / total, // multiplicative devig for display
@@ -1353,13 +1742,14 @@ function inferSport(tags = [], sportKey = '') {
   if (tagStr.includes('ncaab') || tagStr.includes('basketball_ncaab')) return 'NCAAB';
   if (tagStr.includes('mlb') || tagStr.includes('baseball_mlb')) return 'MLB';
   if (tagStr.includes('nhl') || tagStr.includes('icehockey')) return 'NHL';
+  // Golf before soccer — sport_key like golf_the_open_championship_winner contains "championship"
+  if (tagStr.includes('golf') || tagStr.includes('pga') || /golf_/.test(tagStr) || tagStr.includes('masters')) return 'Golf';
   if (tagStr.includes('mls') || tagStr.includes('soccer_usa')) return 'Soccer';
   if (tagStr.includes('epl') || tagStr.includes('soccer_epl')) return 'Soccer';
-  if (tagStr.includes('ucl') || tagStr.includes('champions')) return 'Soccer';
+  if (tagStr.includes('ucl') || tagStr.includes('champions league')) return 'Soccer';
   if (tagStr.includes('soccer')) return 'Soccer';
   if (tagStr.includes('ufc') || tagStr.includes('mma')) return 'UFC/MMA';
   if (tagStr.includes('boxing')) return 'Boxing';
-  if (tagStr.includes('golf') || tagStr.includes('pga') || tagStr.includes('masters')) return 'Golf';
   if (tagStr.includes('tennis') || tagStr.includes('atp') || tagStr.includes('wta') || tagStr.includes('wimbledon')) return 'Tennis';
   if (tagStr.includes('nascar') || tagStr.includes('formula') || tagStr.includes('f1') || tagStr.includes('motorsport') || tagStr.includes('racing')) return 'Racing';
   return 'Sports';

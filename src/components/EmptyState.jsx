@@ -6,18 +6,13 @@ export function NoApiKey({ onSettingsOpen }) {
       <div className="w-16 h-16 rounded-2xl bg-zinc-800 border border-zinc-700 flex items-center justify-center mb-4">
         <Key className="w-8 h-8 text-zinc-500" />
       </div>
-      <h2 className="text-lg font-semibold text-zinc-100 mb-2">Add your Odds API key</h2>
+      <h2 className="text-lg font-semibold text-zinc-100 mb-2">Add an odds API key</h2>
       <p className="text-sm text-zinc-500 max-w-sm mb-6">
-        You need a free API key from{' '}
-        <a
-          href="https://the-odds-api.com"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-green-400 hover:underline"
-        >
-          the-odds-api.com
-        </a>{' '}
-        to fetch sportsbook lines. Polymarket data is free and public.
+        You need at least one key:{' '}
+        <a href="https://the-odds-api.com" target="_blank" rel="noopener noreferrer" className="text-green-400 hover:underline">The Odds API</a>
+        {' '}for NBA/NFL game lines, and/or{' '}
+        <a href="https://oddspapi.io" target="_blank" rel="noopener noreferrer" className="text-green-400 hover:underline">OddsPapi</a>
+        {' '}for weekly PGA Tour events like Charles Schwab. Polymarket data is free.
       </p>
       <button
         onClick={onSettingsOpen}

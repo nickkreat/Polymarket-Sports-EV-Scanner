@@ -186,7 +186,8 @@ const EPL_ALIASES = {
   'newcastle united': ['newcastle', 'newcastle fc', 'magpies', 'toon'],
   'nottingham forest': ['forest', 'nottm forest', 'nffc'],
   'sheffield united': ['sheffield utd', 'blades'],
-  'tottenham hotspur': ['spurs', 'tottenham', 'thfc'],
+  // 'spurs' omitted — conflicts with San Antonio Spurs (NBA)
+  'tottenham hotspur': ['tottenham', 'thfc', 'tottenham hotspur'],
   'west ham united': ['west ham', 'hammers'],
   'wolverhampton wanderers': ['wolves', 'wolverhampton', 'wanderers'],
 };
@@ -413,19 +414,49 @@ function buildAliasMap() {
 
 const ALIAS_MAP = buildAliasMap();
 
+// Outcome labels that must never fuzzy-match to team/player aliases.
+const NON_CANONICAL_TOKENS = new Set([
+  'over', 'under', 'push', 'odd', 'even', 'draw', 'yes', 'no',
+]);
+
 // ── Caches — same names repeat thousands of times across bookmakers ───────────
 const _canonCache  = new Map();
 const _scoreCache  = new Map();
 
-export function canonicalTeamName(raw) {
+export function isOverUnderOutcome(name) {
+  const n = normalize(String(name ?? ''));
+  return n === 'over' || n === 'under' || /^over \d/.test(n) || /^under \d/.test(n);
+}
+
+export function isOverUnderOutcomes(outcomes = []) {
+  if (outcomes.length !== 2) return false;
+  const lower = outcomes.map(o => String(o).toLowerCase().trim());
+  return lower.some(o => o.startsWith('over')) && lower.some(o => o.startsWith('under'));
+}
+
+export function canonicalTeamName(raw, { sportHint } = {}) {
   if (_canonCache.has(raw)) return _canonCache.get(raw);
 
   const n = normalize(raw);
+  if (NON_CANONICAL_TOKENS.has(n) || /^(over|under)( \d|$)/.test(n)) {
+    _canonCache.set(raw, n);
+    return n;
+  }
+
   let result = ALIAS_MAP[n];
 
-  if (!result && n.length >= 4) {
+  // Disambiguate short team nicknames when sport context is known.
+  if (n === 'spurs' && sportHint) {
+    const hint = sportHint.toLowerCase();
+    if (hint.includes('basketball') || hint.includes('nba')) result = 'san antonio spurs';
+    else if (hint.includes('soccer') || hint.includes('epl')) result = 'tottenham hotspur';
+  }
+
+  // Only allow forward substring match (full alias contained in input), never
+  // key.includes(n) — that maps "over" → "lucas glover" and "under" → "thunder".
+  if (!result && n.length >= 5) {
     for (const [key, canonical] of Object.entries(ALIAS_MAP)) {
-      if (key.length >= 4 && (n.includes(key) || key.includes(n))) {
+      if (key.length >= 5 && n.includes(key)) {
         result = canonical;
         break;
       }
@@ -450,13 +481,13 @@ function tokenOverlapScore(a, b) {
 
 // Score how well two team/player names match (0–1)
 // Cached — the same (a,b) pair is checked across many bookmakers/markets.
-export function teamMatchScore(a, b) {
+export function teamMatchScore(a, b, { sportHint } = {}) {
   // Symmetric key
   const key = a <= b ? `${a}|||${b}` : `${b}|||${a}`;
   if (_scoreCache.has(key)) return _scoreCache.get(key);
 
-  const ca = canonicalTeamName(a);
-  const cb = canonicalTeamName(b);
+  const ca = canonicalTeamName(a, { sportHint });
+  const cb = canonicalTeamName(b, { sportHint });
 
   let score = 0;
   if (ca === cb) {

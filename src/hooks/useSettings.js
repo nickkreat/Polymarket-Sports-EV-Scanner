@@ -4,6 +4,9 @@ const STORAGE_KEY = 'pmev_settings';
 
 const DEFAULTS = {
   oddsApiKey: '',
+  oddspApiKey: '',
+  enableOddsPapi: true,
+  enableDraftKingsGolfFallback: true,
   bankroll: 1000,
   kellyFraction: 0.5,
   minEvPct: 5,

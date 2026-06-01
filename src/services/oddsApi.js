@@ -286,6 +286,75 @@ export async function fetchAllSpreadsOdds(apiKey, sportKeys = CORE_SPORT_KEYS, o
 }
 
 /**
+ * Fetch over/under (totals) odds for a sport.
+ * Makes two calls (totals + alternate_totals) and merges like spreads.
+ */
+export async function fetchTotalsOdds(sportKey, apiKey, { regions = 'us,us2' } = {}) {
+  if (!apiKey) throw new Error('No Odds API key configured');
+
+  const cacheKey = `totals|${sportKey}|${regions}`;
+  const cached = _getCached(cacheKey);
+  if (cached) return cached;
+
+  const now = Date.now();
+
+  const fetchOne = async (marketType) => {
+    const params = new URLSearchParams({ apiKey, regions, markets: marketType, oddsFormat: 'american' });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const res = await fetch(`${BASE}/sports/${sportKey}/odds?${params}`, { signal: controller.signal })
+      .finally(() => clearTimeout(timer));
+    if (res.status === 422 || res.status === 404) return [];
+    if (!res.ok) return [];
+    return (await res.json()).filter(
+      e => !e.commence_time || new Date(e.commence_time).getTime() >= now
+    );
+  };
+
+  const [totalsData, altTotalsData] = await Promise.all([
+    fetchOne('totals').catch(() => []),
+    fetchOne('alternate_totals').catch(() => []),
+  ]);
+
+  const altByEventId = new Map(altTotalsData.map(e => [e.id, e]));
+  const merged = totalsData.map(event => {
+    const alt = altByEventId.get(event.id);
+    if (!alt) return event;
+    const mergedBookmakers = event.bookmakers.map(book => {
+      const altBook    = alt.bookmakers?.find(b => b.key === book.key);
+      const altMarkets = altBook?.markets?.filter(m => m.key === 'alternate_totals') ?? [];
+      return { ...book, markets: [...(book.markets ?? []), ...altMarkets] };
+    });
+    const baseBookKeys = new Set(event.bookmakers.map(b => b.key));
+    const extraBooks   = (alt.bookmakers ?? []).filter(b => !baseBookKeys.has(b.key));
+    return { ...event, bookmakers: [...mergedBookmakers, ...extraBooks] };
+  });
+
+  const baseEventIds = new Set(totalsData.map(e => e.id));
+  const altOnly = altTotalsData.filter(e => !baseEventIds.has(e.id));
+  const result = [...merged, ...altOnly];
+  if (result.length > 0) _setCached(cacheKey, result);
+  return result;
+}
+
+/**
+ * Fetch over/under odds for a list of sport keys in parallel.
+ */
+export async function fetchAllTotalsOdds(apiKey, sportKeys = CORE_SPORT_KEYS, options = {}) {
+  const results = await Promise.allSettled(
+    sportKeys.map(sk => fetchTotalsOdds(sk, apiKey, options))
+  );
+
+  const events = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      events.push(...r.value);
+    }
+  }
+  return events;
+}
+
+/**
  * Fetch all available sports from The Odds API (includes in-season flag).
  */
 export async function fetchAvailableSports(apiKey) {
